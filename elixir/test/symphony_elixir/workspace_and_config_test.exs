@@ -85,7 +85,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert File.read!(Path.join(second_workspace, "README.md")) == "changed\n"
       assert File.read!(Path.join(second_workspace, "local-progress.txt")) == "in progress\n"
       assert File.read!(Path.join([second_workspace, "deps", "cache.txt"])) == "cached deps\n"
-      assert File.read!(Path.join([second_workspace, "_build", "artifact.txt"])) == "compiled artifact\n"
+
+      assert File.read!(Path.join([second_workspace, "_build", "artifact.txt"])) ==
+               "compiled artifact\n"
+
       assert File.read!(Path.join([second_workspace, "tmp", "scratch.txt"])) == "remove me\n"
     after
       File.rm_rf(workspace_root)
@@ -134,7 +137,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
 
       assert {:ok, canonical_outside_root} = SymphonyElixir.PathSafety.canonicalize(outside_root)
-      assert {:ok, canonical_workspace_root} = SymphonyElixir.PathSafety.canonicalize(workspace_root)
+
+      assert {:ok, canonical_workspace_root} =
+               SymphonyElixir.PathSafety.canonicalize(workspace_root)
 
       assert {:error, {:workspace_outside_root, ^canonical_outside_root, ^canonical_workspace_root}} =
                Workspace.create_for_issue("MT-SYM")
@@ -262,7 +267,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     try do
       target_workspace = Path.join(workspace_root, "S_1")
-      untouched_workspace = Path.join(workspace_root, "OTHER-#{System.unique_integer([:positive])}")
+
+      untouched_workspace =
+        Path.join(workspace_root, "OTHER-#{System.unique_integer([:positive])}")
 
       File.mkdir_p!(target_workspace)
       File.mkdir_p!(untouched_workspace)
@@ -424,6 +431,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Enum.map(issues, & &1.id) == issue_ids
 
     assert_receive {:fetch_issue_states_page, query, %{ids: ^first_batch_ids, first: 50, relationFirst: 50}}
+
     assert query =~ "SymphonyLinearIssuesById"
 
     assert_receive {:fetch_issue_states_page, ^query, %{ids: ^second_batch_ids, first: 5, relationFirst: 50}}
@@ -581,7 +589,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              Orchestrator.revalidate_issue_for_dispatch_for_test(stale_issue, fetcher)
 
     assert skipped_issue.identifier == "MT-1005"
-    assert skipped_issue.blocked_by == [%{id: "blocker-3", identifier: "MT-1006", state: "In Progress"}]
+
+    assert skipped_issue.blocked_by == [
+             %{id: "blocker-3", identifier: "MT-1006", state: "In Progress"}
+           ]
   end
 
   test "workspace remove returns error information for missing directory" do
@@ -741,7 +752,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.tracker.endpoint == "https://api.linear.app/graphql"
     assert config.tracker.api_key == nil
     assert config.tracker.project_slug == nil
-    assert config.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
+    assert config.workspace.root == Path.join(System.user_home!(), "Symphony Workspaces")
     assert config.worker.max_concurrent_agents_per_host == nil
     assert config.agent.max_concurrent_agents == 10
     assert config.codex.command == "codex app-server"
@@ -757,7 +768,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.thread_sandbox == "workspace-write"
 
     assert {:ok, canonical_default_workspace_root} =
-             SymphonyElixir.PathSafety.canonicalize(Path.join(System.tmp_dir!(), "symphony_workspaces"))
+             SymphonyElixir.PathSafety.canonicalize(Path.join(System.user_home!(), "Symphony Workspaces"))
 
     assert Config.codex_turn_sandbox_policy() == %{
              "type" => "workspaceWrite",
@@ -1049,7 +1060,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              })
 
     assert settings.tracker.api_key == nil
-    assert settings.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
+    assert settings.workspace.root == Path.join(System.user_home!(), "Symphony Workspaces")
     assert settings.studio_runner.signing_secret == nil
 
     assert settings.codex.approval_policy == %{
@@ -1063,7 +1074,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              })
 
     assert settings.tracker.api_key == "fallback-linear-token"
-    assert settings.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
+    assert settings.workspace.root == Path.join(System.user_home!(), "Symphony Workspaces")
   end
 
   test "schema resolves sandbox policies from explicit and default workspaces" do
@@ -1079,7 +1090,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              workspace: %Schema.Workspace{root: ""}
            }) == %{
              "type" => "workspaceWrite",
-             "writableRoots" => [Path.expand(Path.join(System.tmp_dir!(), "symphony_workspaces"))],
+             "writableRoots" => [
+               Path.expand(Path.join(System.user_home!(), "Symphony Workspaces"))
+             ],
              "readOnlyAccess" => %{"type" => "fullAccess"},
              "networkAccess" => false,
              "excludeTmpdirEnvVar" => false,
@@ -1221,7 +1234,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       read_only_settings = %{
         settings
-        | codex: %{settings.codex | turn_sandbox_policy: %{"type" => "readOnly", "networkAccess" => true}}
+        | codex: %{
+            settings.codex
+            | turn_sandbox_policy: %{"type" => "readOnly", "networkAccess" => true}
+          }
       }
 
       assert {:ok, %{"type" => "readOnly", "networkAccess" => true}} =
@@ -1229,7 +1245,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       future_settings = %{
         settings
-        | codex: %{settings.codex | turn_sandbox_policy: %{"type" => "futureSandbox", "nested" => %{"flag" => true}}}
+        | codex: %{
+            settings.codex
+            | turn_sandbox_policy: %{"type" => "futureSandbox", "nested" => %{"flag" => true}}
+          }
       }
 
       assert {:ok, %{"type" => "futureSandbox", "nested" => %{"flag" => true}}} =

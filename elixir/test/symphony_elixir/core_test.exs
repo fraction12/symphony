@@ -98,8 +98,7 @@ defmodule SymphonyElixir.CoreTest do
 
     tracker = Map.get(config, "tracker", %{})
     assert is_map(tracker)
-    assert Map.get(tracker, "kind") == "linear"
-    assert is_binary(Map.get(tracker, "project_slug"))
+    assert Map.get(tracker, "kind") == "memory"
     assert is_list(Map.get(tracker, "active_states"))
     assert is_list(Map.get(tracker, "terminal_states"))
 
@@ -959,17 +958,15 @@ defmodule SymphonyElixir.CoreTest do
 
     prompt = PromptBuilder.build_prompt(issue, attempt: 2)
 
-    assert prompt =~ "You are working on a Linear ticket `MT-616`"
-    assert prompt =~ "Issue context:"
-    assert prompt =~ "Identifier: MT-616"
-    assert prompt =~ "Title: Use rich templates for WORKFLOW.md"
-    assert prompt =~ "Current status: In Progress"
-    assert prompt =~ "https://example.org/issues/MT-616/use-rich-templates-for-workflowmd"
-    assert prompt =~ "This is an unattended orchestration session."
-    assert prompt =~ "Only stop early for a true blocker"
-    assert prompt =~ "Do not include \"next steps for user\""
-    assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
-    assert prompt =~ "Do not call `gh pr merge` directly"
+    assert prompt =~ "You are Symphony Studio Runner working on an OpenSpec change"
+    assert prompt =~ "This workflow is OpenSpec-native"
+    assert prompt =~ "Do not use Linear"
+    assert prompt =~ "Work only in the provided Symphony-managed repository workspace"
+    assert prompt =~ "openspec/changes/<change>/"
+    assert prompt =~ "Create or switch to the branch requested in the Studio Runner prompt"
+    assert prompt =~ "Push the branch and open a pull request"
+    assert prompt =~ "Do not treat local-only changes as complete"
+    assert prompt =~ "Do not auto-merge, archive, or land"
     assert prompt =~ "Continuation context:"
     assert prompt =~ "retry attempt #2"
   end

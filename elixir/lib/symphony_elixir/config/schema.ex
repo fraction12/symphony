@@ -51,6 +51,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:project_slug, :string)
       field(:assignee, :string)
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
+
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
     end
 
@@ -90,7 +91,7 @@ defmodule SymphonyElixir.Config.Schema do
 
     @primary_key false
     embedded_schema do
-      field(:root, :string, default: Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      field(:root, :string, default: Path.join(System.user_home!(), "Symphony Workspaces"))
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -139,7 +140,12 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
+        [
+          :max_concurrent_agents,
+          :max_turns,
+          :max_retry_backoff_ms,
+          :max_concurrent_agents_by_state
+        ],
         empty_values: []
       )
       |> validate_number(:max_concurrent_agents, greater_than: 0)
@@ -395,7 +401,11 @@ defmodule SymphonyElixir.Config.Schema do
 
     workspace = %{
       settings.workspace
-      | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      | root:
+          resolve_path_value(
+            settings.workspace.root,
+            Path.join(System.user_home!(), "Symphony Workspaces")
+          )
     }
 
     codex = %{
@@ -413,7 +423,13 @@ defmodule SymphonyElixir.Config.Schema do
           )
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex, studio_runner: studio_runner}
+    %{
+      settings
+      | tracker: tracker,
+        workspace: workspace,
+        codex: codex,
+        studio_runner: studio_runner
+    }
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -548,7 +564,7 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp expand_local_workspace_root(_workspace_root) do
-    Path.expand(Path.join(System.tmp_dir!(), "symphony_workspaces"))
+    Path.expand(Path.join(System.user_home!(), "Symphony Workspaces"))
   end
 
   defp format_errors(changeset) do

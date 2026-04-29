@@ -120,6 +120,12 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, state}
   end
 
+  def handle_info({:external_work_result, run_id, result}, state) when is_binary(run_id) do
+    state = merge_external_work_result(state, run_id, result)
+    notify_dashboard()
+    {:noreply, state}
+  end
+
   def handle_info(
         {:DOWN, ref, :process, _pid, reason},
         %{running: running} = state
@@ -339,7 +345,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
-  @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
+  @spec select_worker_host_for_test(term(), String.t() | nil) ::
+          String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
     select_worker_host(state, preferred_worker_host)
   end
@@ -669,12 +676,17 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
-    case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
+    case revalidate_issue_for_dispatch(
+           issue,
+           &Tracker.fetch_issue_states_by_ids/1,
+           terminal_state_set()
+         ) do
       {:ok, %Issue{} = refreshed_issue} ->
         do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
+
         state
 
       {:skip, %Issue{} = refreshed_issue} ->
@@ -684,6 +696,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.warning("Skipping dispatch; issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
+
         state
     end
   end
@@ -694,6 +707,7 @@ defmodule SymphonyElixir.Orchestrator do
     case select_worker_host(state, preferred_worker_host) do
       :no_worker_capacity ->
         Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
+
         state
 
       worker_host ->
@@ -820,7 +834,8 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp pop_retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
+  defp pop_retry_attempt_state(%State{} = state, issue_id, retry_token)
+       when is_reference(retry_token) do
     case Map.get(state.retry_attempts, issue_id) do
       %{attempt: attempt, retry_token: ^retry_token} = retry_entry ->
         metadata = %{
@@ -936,7 +951,8 @@ defmodule SymphonyElixir.Orchestrator do
     %{state | claimed: MapSet.delete(state.claimed, issue_id)}
   end
 
-  defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
+  defp retry_delay(attempt, metadata)
+       when is_integer(attempt) and attempt > 0 and is_map(metadata) do
     if metadata[:delay_type] == :continuation and attempt == 1 do
       @continuation_retry_delay_ms
     else
@@ -946,7 +962,11 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp failure_retry_delay(attempt) do
     max_delay_power = min(attempt - 1, 10)
-    min(@failure_retry_base_ms * (1 <<< max_delay_power), Config.settings!().agent.max_retry_backoff_ms)
+
+    min(
+      @failure_retry_base_ms * (1 <<< max_delay_power),
+      Config.settings!().agent.max_retry_backoff_ms
+    )
   end
 
   defp normalize_retry_attempt(attempt) when is_integer(attempt) and attempt > 0, do: attempt
@@ -1018,7 +1038,8 @@ defmodule SymphonyElixir.Orchestrator do
     |> elem(0)
   end
 
-  defp running_worker_host_count(running, worker_host) when is_map(running) and is_binary(worker_host) do
+  defp running_worker_host_count(running, worker_host)
+       when is_map(running) and is_binary(worker_host) do
     Enum.count(running, fn
       {_issue_id, %{worker_host: ^worker_host}} -> true
       _ -> false
@@ -1083,6 +1104,44 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp merge_external_work_result(%State{} = state, run_id, result) when is_binary(run_id) do
+    case Map.get(state.external_running, run_id) do
+      %{event_id: event_id} ->
+        update_external_event_payload(state, event_id, external_result_updates(result))
+
+      _ ->
+        state
+    end
+  end
+
+  defp external_result_updates({:ok, metadata}) when is_map(metadata) do
+    metadata
+    |> Map.put_new(:status, "blocked")
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp external_result_updates({:error, reason}) do
+    %{status: "failed", error: inspect(reason)}
+  end
+
+  defp external_result_updates(_result), do: %{status: "completed"}
+
+  defp update_external_event_payload(%State{} = state, event_id, updates) when is_map(updates) do
+    external_events =
+      case Map.fetch(state.external_events, event_id) do
+        {:ok, event} ->
+          payload = Map.merge(event.payload, updates)
+          status = Map.get(updates, :status, event.status)
+          Map.put(state.external_events, event_id, %{event | status: status, payload: payload})
+
+        :error ->
+          state.external_events
+      end
+
+    %{state | external_events: external_events}
+  end
+
   defp dispatch_external_work_item(%State{} = state, %WorkItem{} = work_item, opts) do
     case Map.get(state.external_events, work_item.event_id) do
       %{} = existing_event ->
@@ -1106,6 +1165,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       run_id ->
         event = external_event_for_run_id(state.external_events, run_id)
+
         {{:error, {:duplicate_repo_change, external_conflict_payload(work_item, event, run_id)}}, state}
     end
   end
@@ -1115,8 +1175,12 @@ defmodule SymphonyElixir.Orchestrator do
     started_at = DateTime.utc_now()
     work_item = %{work_item | run_id: run_id}
     executor = Keyword.get(opts, :executor, &Executor.run/1)
+    parent = self()
 
-    case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn -> executor.(work_item) end) do
+    case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
+           result = executor.(work_item)
+           send(parent, {:external_work_result, run_id, result})
+         end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
 
@@ -1134,7 +1198,7 @@ defmodule SymphonyElixir.Orchestrator do
             external_events:
               Map.put(state.external_events, work_item.event_id, %{
                 payload: WorkItem.response_payload(work_item),
-                status: "accepted",
+                status: "running",
                 repo_change_key: repo_change_key,
                 run_id: run_id,
                 recorded_at: started_at
@@ -1163,7 +1227,8 @@ defmodule SymphonyElixir.Orchestrator do
     {Map.get(state.external_running, run_id), %{state | external_running: Map.delete(state.external_running, run_id)}}
   end
 
-  defp release_external_claim(%State{} = state, repo_change_key) when is_binary(repo_change_key) do
+  defp release_external_claim(%State{} = state, repo_change_key)
+       when is_binary(repo_change_key) do
     %{state | external_claims: Map.delete(state.external_claims, repo_change_key)}
   end
 
@@ -1171,10 +1236,12 @@ defmodule SymphonyElixir.Orchestrator do
     external_events =
       case Map.fetch(state.external_events, event_id) do
         {:ok, event} ->
+          status = terminal_external_status(event.status, status)
+
           payload =
             event.payload
             |> Map.put(:status, status)
-            |> maybe_put_external_error(reason)
+            |> maybe_put_external_error(reason, event.status)
 
           Map.put(state.external_events, event_id, %{event | status: status, payload: payload})
 
@@ -1221,10 +1288,22 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
-  defp maybe_put_external_error(payload, :normal), do: Map.delete(payload, :error)
-  defp maybe_put_external_error(payload, reason), do: Map.put(payload, :error, inspect(reason))
+  defp terminal_external_status(current_status, _down_status)
+       when current_status in ["completed", "blocked", "failed"], do: current_status
 
-  defp external_status_for_reason(:normal), do: "accepted"
+  defp terminal_external_status(_current_status, down_status), do: down_status
+
+  defp maybe_put_external_error(payload, :normal, _previous_status),
+    do: Map.delete(payload, :error)
+
+  defp maybe_put_external_error(payload, :noproc, previous_status)
+       when previous_status in ["completed", "blocked"], do: Map.delete(payload, :error)
+
+  defp maybe_put_external_error(payload, reason, _previous_status),
+    do: Map.put(payload, :error, inspect(reason))
+
+  defp external_status_for_reason(:normal), do: "completed"
+  defp external_status_for_reason(:noproc), do: "completed"
   defp external_status_for_reason(_reason), do: "failed"
 
   defp generate_run_id do
