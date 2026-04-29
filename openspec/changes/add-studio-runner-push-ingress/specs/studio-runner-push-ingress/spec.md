@@ -31,6 +31,12 @@ Studio Runner SHALL expose a push ingress endpoint for OpenSpec Studio `build.re
 - **THEN** Studio Runner SHALL reject the request as unsupported
 - **AND** Studio Runner SHALL NOT launch an agent run
 
+#### Scenario: Unknown repository path is rejected
+- **GIVEN** a signed request identifies a repository path that does not exist on the runner host
+- **WHEN** the request is posted to the Studio Runner event ingress
+- **THEN** Studio Runner SHALL reject the request before claiming or dispatching work
+- **AND** Studio Runner SHALL NOT launch an agent run
+
 ### Requirement: OpenSpec push dispatch bypasses tracker polling
 Studio Runner SHALL process OpenSpec Studio dispatch through a push path that does not require Linear configuration, tracker polling, or OpenSpec-as-tracker-adapter behavior.
 

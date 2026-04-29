@@ -34,6 +34,9 @@ codex:
   thread_sandbox: workspace-write
   turn_sandbox_policy:
     type: workspaceWrite
+studio_runner:
+  signing_secret: $STUDIO_RUNNER_SIGNING_SECRET
+  replay_window_seconds: 300
 ---
 
 You are working on a Linear ticket `{{ issue.identifier }}`

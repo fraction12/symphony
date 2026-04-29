@@ -15,10 +15,12 @@ defmodule SymphonyElixirWeb.Presenter do
           generated_at: generated_at,
           counts: %{
             running: length(snapshot.running),
-            retrying: length(snapshot.retrying)
+            retrying: length(snapshot.retrying),
+            studio_runner_running: length(studio_runner_snapshot(snapshot).running)
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
+          studio_runner: studio_runner_payload(studio_runner_snapshot(snapshot)),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }
@@ -113,6 +115,37 @@ defmodule SymphonyElixirWeb.Presenter do
         output_tokens: entry.codex_output_tokens,
         total_tokens: entry.codex_total_tokens
       }
+    }
+  end
+
+  defp studio_runner_snapshot(snapshot), do: Map.get(snapshot, :studio_runner, %{running: [], events: []})
+
+  defp studio_runner_payload(studio_runner) when is_map(studio_runner) do
+    %{
+      running: Enum.map(Map.get(studio_runner, :running, []), &studio_runner_running_payload/1),
+      events: Enum.map(Map.get(studio_runner, :events, []), &studio_runner_event_payload/1)
+    }
+  end
+
+  defp studio_runner_payload(_studio_runner), do: %{running: [], events: []}
+
+  defp studio_runner_running_payload(entry) do
+    %{
+      run_id: entry.run_id,
+      event_id: entry.event_id,
+      repo_change_key: entry.repo_change_key,
+      started_at: iso8601(entry.started_at),
+      runtime_seconds: entry.runtime_seconds
+    }
+  end
+
+  defp studio_runner_event_payload(entry) do
+    %{
+      event_id: entry.event_id,
+      status: entry.status,
+      run_id: entry.run_id,
+      repo_change_key: entry.repo_change_key,
+      recorded_at: iso8601(entry.recorded_at)
     }
   end
 

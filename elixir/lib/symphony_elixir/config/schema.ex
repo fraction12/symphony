@@ -261,6 +261,25 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule StudioRunner do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:signing_secret, :string)
+      field(:replay_window_seconds, :integer, default: 300)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:signing_secret, :replay_window_seconds], empty_values: [])
+      |> validate_number(:replay_window_seconds, greater_than: 0)
+    end
+  end
+
   embedded_schema do
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
@@ -271,6 +290,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:studio_runner, StudioRunner, on_replace: :update, defaults_to_struct: true)
   end
 
   @spec parse(map()) :: {:ok, %__MODULE__{}} | {:error, {:invalid_workflow_config, String.t()}}
@@ -363,6 +383,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
+    |> cast_embed(:studio_runner, with: &StudioRunner.changeset/2)
   end
 
   defp finalize_settings(settings) do
@@ -383,7 +404,16 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    studio_runner = %{
+      settings.studio_runner
+      | signing_secret:
+          resolve_secret_setting(
+            settings.studio_runner.signing_secret,
+            System.get_env("STUDIO_RUNNER_SIGNING_SECRET")
+          )
+    }
+
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, studio_runner: studio_runner}
   end
 
   defp normalize_keys(value) when is_map(value) do

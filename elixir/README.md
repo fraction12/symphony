@@ -143,13 +143,20 @@ hooks:
     git clone --depth 1 "$SOURCE_REPO_URL" .
 codex:
   command: "$CODEX_BIN --config 'model=\"gpt-5.5\"' app-server"
+studio_runner:
+  signing_secret: $STUDIO_RUNNER_SIGNING_SECRET
+  replay_window_seconds: 300
 ```
 
 - If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
-  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, `/api/v1/refresh`,
+  `/api/v1/studio-runner/health`, and `/api/v1/studio-runner/events`.
+- `studio_runner.signing_secret` enables signed OpenSpec Studio push ingress. It reads from
+  `STUDIO_RUNNER_SIGNING_SECRET` when unset or when value is `$STUDIO_RUNNER_SIGNING_SECRET`.
+- `studio_runner.replay_window_seconds` controls the webhook replay window. Default: `300`.
 
 ## Web dashboard
 

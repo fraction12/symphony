@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.Orchestrator do
   @moduledoc """
-  Polls Linear and dispatches repository copies to Codex-backed workers.
+  Polls Linear and dispatches repository copies or accepted Studio Runner work.
   """
 
   use GenServer
@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.StudioRunner.{Executor, WorkItem}
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
@@ -34,6 +35,9 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_timer_ref,
       :tick_token,
       running: %{},
+      external_running: %{},
+      external_events: %{},
+      external_claims: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
       retry_attempts: %{},
@@ -122,7 +126,14 @@ defmodule SymphonyElixir.Orchestrator do
       ) do
     case find_issue_id_for_ref(running, ref) do
       nil ->
-        {:noreply, state}
+        case handle_external_run_down(state, ref, reason) do
+          {:handled, next_state} ->
+            notify_dashboard()
+            {:noreply, next_state}
+
+          :unhandled ->
+            {:noreply, state}
+        end
 
       issue_id ->
         {running_entry, state} = pop_running_entry(state, issue_id)
@@ -1049,6 +1060,182 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
+  defp handle_external_run_down(%State{} = state, ref, reason) when is_reference(ref) do
+    case find_external_run_id_for_ref(state.external_running, ref) do
+      nil ->
+        :unhandled
+
+      run_id ->
+        {running_entry, state} = pop_external_running_entry(state, run_id)
+
+        state =
+          state
+          |> release_external_claim(running_entry.repo_change_key)
+          |> update_external_event(
+            running_entry.event_id,
+            external_status_for_reason(reason),
+            reason
+          )
+
+        Logger.info("Studio Runner work finished event_id=#{running_entry.event_id} run_id=#{run_id} reason=#{inspect(reason)}")
+
+        {:handled, state}
+    end
+  end
+
+  defp dispatch_external_work_item(%State{} = state, %WorkItem{} = work_item, opts) do
+    case Map.get(state.external_events, work_item.event_id) do
+      %{} = existing_event ->
+        {{:ok, existing_event.payload}, state}
+
+      nil ->
+        maybe_start_external_work(state, work_item, opts)
+    end
+  end
+
+  defp maybe_start_external_work(%State{} = state, %WorkItem{} = work_item, opts) do
+    repo_change_key = WorkItem.repo_change_key(work_item)
+
+    case Map.get(state.external_claims, repo_change_key) do
+      nil ->
+        if available_slots(state) > 0 do
+          start_external_work(state, work_item, repo_change_key, opts)
+        else
+          {{:error, :capacity_exhausted}, state}
+        end
+
+      run_id ->
+        event = external_event_for_run_id(state.external_events, run_id)
+        {{:error, {:duplicate_repo_change, external_conflict_payload(work_item, event, run_id)}}, state}
+    end
+  end
+
+  defp start_external_work(%State{} = state, %WorkItem{} = work_item, repo_change_key, opts) do
+    run_id = generate_run_id()
+    started_at = DateTime.utc_now()
+    work_item = %{work_item | run_id: run_id}
+    executor = Keyword.get(opts, :executor, &Executor.run/1)
+
+    case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn -> executor.(work_item) end) do
+      {:ok, pid} ->
+        ref = Process.monitor(pid)
+
+        next_state = %{
+          state
+          | external_running:
+              Map.put(state.external_running, run_id, %{
+                pid: pid,
+                ref: ref,
+                run_id: run_id,
+                event_id: work_item.event_id,
+                repo_change_key: repo_change_key,
+                started_at: started_at
+              }),
+            external_events:
+              Map.put(state.external_events, work_item.event_id, %{
+                payload: WorkItem.response_payload(work_item),
+                status: "accepted",
+                repo_change_key: repo_change_key,
+                run_id: run_id,
+                recorded_at: started_at
+              }),
+            external_claims: Map.put(state.external_claims, repo_change_key, run_id)
+        }
+
+        Logger.info("Accepted Studio Runner work event_id=#{work_item.event_id} run_id=#{run_id} repo_path=#{work_item.repo_path} change=#{work_item.change}")
+
+        {{:ok, WorkItem.response_payload(work_item)}, next_state}
+
+      {:error, reason} ->
+        Logger.error("Unable to dispatch Studio Runner work event_id=#{work_item.event_id} repo_path=#{work_item.repo_path} change=#{work_item.change}: #{inspect(reason)}")
+
+        {{:error, {:dispatch_failed, reason}}, state}
+    end
+  end
+
+  defp find_external_run_id_for_ref(external_running, ref) when is_map(external_running) do
+    Enum.find_value(external_running, fn {run_id, %{ref: running_ref}} ->
+      if running_ref == ref, do: run_id
+    end)
+  end
+
+  defp pop_external_running_entry(%State{} = state, run_id) do
+    {Map.get(state.external_running, run_id), %{state | external_running: Map.delete(state.external_running, run_id)}}
+  end
+
+  defp release_external_claim(%State{} = state, repo_change_key) when is_binary(repo_change_key) do
+    %{state | external_claims: Map.delete(state.external_claims, repo_change_key)}
+  end
+
+  defp update_external_event(%State{} = state, event_id, status, reason) do
+    external_events =
+      case Map.fetch(state.external_events, event_id) do
+        {:ok, event} ->
+          payload =
+            event.payload
+            |> Map.put(:status, status)
+            |> maybe_put_external_error(reason)
+
+          Map.put(state.external_events, event_id, %{event | status: status, payload: payload})
+
+        :error ->
+          state.external_events
+      end
+
+    %{state | external_events: external_events}
+  end
+
+  defp external_conflict_payload(%WorkItem{} = work_item, nil, run_id) do
+    %{
+      status: "conflict",
+      eventId: work_item.event_id,
+      runId: run_id,
+      repoPath: work_item.repo_path,
+      repoName: work_item.repo_name,
+      change: work_item.change,
+      error: %{
+        code: "duplicate_repo_change",
+        message: "Work already running for repository/change"
+      }
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp external_conflict_payload(%WorkItem{} = work_item, event, _run_id) do
+    event.payload
+    |> Map.take([:runId, :repoPath, :repoName, :change])
+    |> Map.merge(%{
+      status: "conflict",
+      eventId: work_item.event_id,
+      error: %{
+        code: "duplicate_repo_change",
+        message: "Work already running for repository/change"
+      }
+    })
+  end
+
+  defp external_event_for_run_id(external_events, run_id) when is_map(external_events) do
+    Enum.find_value(external_events, fn {_event_id, event} ->
+      if Map.get(event, :run_id) == run_id, do: event
+    end)
+  end
+
+  defp maybe_put_external_error(payload, :normal), do: Map.delete(payload, :error)
+  defp maybe_put_external_error(payload, reason), do: Map.put(payload, :error, inspect(reason))
+
+  defp external_status_for_reason(:normal), do: "accepted"
+  defp external_status_for_reason(_reason), do: "failed"
+
+  defp generate_run_id do
+    encoded = Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+    "run_" <> encoded
+  end
+
+  defp server_available?(server) when is_pid(server), do: Process.alive?(server)
+  defp server_available?(server) when is_atom(server), do: is_pid(Process.whereis(server))
+  defp server_available?(_server), do: false
+
   defp running_entry_session_id(%{session_id: session_id}) when is_binary(session_id),
     do: session_id
 
@@ -1061,9 +1248,32 @@ defmodule SymphonyElixir.Orchestrator do
   defp available_slots(%State{} = state) do
     max(
       (state.max_concurrent_agents || Config.settings!().agent.max_concurrent_agents) -
-        map_size(state.running),
+        (map_size(state.running) + map_size(state.external_running)),
       0
     )
+  end
+
+  @type dispatch_external_result ::
+          {:ok, map()}
+          | {:error,
+             :unavailable
+             | :capacity_exhausted
+             | {:duplicate_repo_change, map()}
+             | {:dispatch_failed, term()}}
+
+  @spec dispatch_external_work(WorkItem.t(), keyword()) :: dispatch_external_result()
+  def dispatch_external_work(%WorkItem{} = work_item, opts \\ []) do
+    dispatch_external_work(__MODULE__, work_item, opts)
+  end
+
+  @spec dispatch_external_work(GenServer.server(), WorkItem.t(), keyword()) ::
+          dispatch_external_result()
+  def dispatch_external_work(server, %WorkItem{} = work_item, opts) when is_list(opts) do
+    if server_available?(server) do
+      GenServer.call(server, {:dispatch_external_work, work_item, opts})
+    else
+      {:error, :unavailable}
+    end
   end
 
   @spec request_refresh() :: map() | :unavailable
@@ -1073,7 +1283,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   @spec request_refresh(GenServer.server()) :: map() | :unavailable
   def request_refresh(server) do
-    if Process.whereis(server) do
+    if server_available?(server) do
       GenServer.call(server, :request_refresh)
     else
       :unavailable
@@ -1085,7 +1295,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   @spec snapshot(GenServer.server(), timeout()) :: map() | :timeout | :unavailable
   def snapshot(server, timeout) do
-    if Process.whereis(server) do
+    if server_available?(server) do
       try do
         GenServer.call(server, :snapshot, timeout)
       catch
@@ -1095,6 +1305,29 @@ defmodule SymphonyElixir.Orchestrator do
     else
       :unavailable
     end
+  end
+
+  @impl true
+  def handle_call(:request_refresh, _from, state) do
+    now_ms = System.monotonic_time(:millisecond)
+    already_due? = is_integer(state.next_poll_due_at_ms) and state.next_poll_due_at_ms <= now_ms
+    coalesced = state.poll_check_in_progress == true or already_due?
+    state = if coalesced, do: state, else: schedule_tick(state, 0)
+
+    {:reply,
+     %{
+       queued: true,
+       coalesced: coalesced,
+       requested_at: DateTime.utc_now(),
+       operations: ["poll", "reconcile"]
+     }, state}
+  end
+
+  def handle_call({:dispatch_external_work, %WorkItem{} = work_item, opts}, _from, state) do
+    state = refresh_runtime_config(state)
+    {reply, next_state} = dispatch_external_work_item(state, work_item, opts)
+    notify_dashboard()
+    {:reply, reply, next_state}
   end
 
   @impl true
@@ -1126,6 +1359,8 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
+    studio_runner = studio_runner_snapshot(state, now)
+
     retrying =
       state.retry_attempts
       |> Enum.map(fn {issue_id, %{attempt: attempt, due_at_ms: due_at_ms} = retry} ->
@@ -1144,6 +1379,7 @@ defmodule SymphonyElixir.Orchestrator do
      %{
        running: running,
        retrying: retrying,
+       studio_runner: studio_runner,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -1154,19 +1390,31 @@ defmodule SymphonyElixir.Orchestrator do
      }, state}
   end
 
-  def handle_call(:request_refresh, _from, state) do
-    now_ms = System.monotonic_time(:millisecond)
-    already_due? = is_integer(state.next_poll_due_at_ms) and state.next_poll_due_at_ms <= now_ms
-    coalesced = state.poll_check_in_progress == true or already_due?
-    state = if coalesced, do: state, else: schedule_tick(state, 0)
-
-    {:reply,
-     %{
-       queued: true,
-       coalesced: coalesced,
-       requested_at: DateTime.utc_now(),
-       operations: ["poll", "reconcile"]
-     }, state}
+  defp studio_runner_snapshot(%State{} = state, now) do
+    %{
+      running:
+        state.external_running
+        |> Enum.map(fn {run_id, metadata} ->
+          %{
+            run_id: run_id,
+            event_id: metadata.event_id,
+            repo_change_key: metadata.repo_change_key,
+            started_at: metadata.started_at,
+            runtime_seconds: running_seconds(metadata.started_at, now)
+          }
+        end),
+      events:
+        state.external_events
+        |> Enum.map(fn {event_id, event} ->
+          %{
+            event_id: event_id,
+            status: event.status,
+            run_id: event.run_id,
+            repo_change_key: event.repo_change_key,
+            recorded_at: event.recorded_at
+          }
+        end)
+    }
   end
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do

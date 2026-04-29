@@ -771,6 +771,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.turn_timeout_ms == 3_600_000
     assert config.codex.read_timeout_ms == 5_000
     assert config.codex.stall_timeout_ms == 300_000
+    assert config.studio_runner.signing_secret == nil
+    assert config.studio_runner.replay_window_seconds == 300
 
     write_workflow_file!(Workflow.workflow_file_path(),
       codex_command: "codex --config 'model=\"gpt-5.5\"' app-server"
@@ -905,16 +907,28 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       restore_env(api_key_env_var, previous_api_key)
     end)
 
+    signing_secret_env_var = "SYMP_STUDIO_SECRET_#{System.unique_integer([:positive])}"
+    signing_secret = "studio-secret"
+    previous_signing_secret = System.get_env(signing_secret_env_var)
+
+    System.put_env(signing_secret_env_var, signing_secret)
+
+    on_exit(fn ->
+      restore_env(signing_secret_env_var, previous_signing_secret)
+    end)
+
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: "$#{api_key_env_var}",
       workspace_root: "$#{workspace_env_var}",
-      codex_command: "#{codex_bin} app-server"
+      codex_command: "#{codex_bin} app-server",
+      studio_runner_signing_secret: "$#{signing_secret_env_var}"
     )
 
     config = Config.settings!()
     assert config.tracker.api_key == api_key
     assert config.workspace.root == Path.expand(workspace_root)
     assert config.codex.command == "#{codex_bin} app-server"
+    assert config.studio_runner.signing_secret == signing_secret
   end
 
   test "config no longer resolves legacy env: references" do
@@ -1030,11 +1044,13 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              Schema.parse(%{
                tracker: %{api_key: "$#{empty_secret_env}"},
                workspace: %{root: "$#{missing_workspace_env}"},
-               codex: %{approval_policy: %{reject: %{sandbox_approval: true}}}
+               codex: %{approval_policy: %{reject: %{sandbox_approval: true}}},
+               studio_runner: %{signing_secret: "$#{empty_secret_env}"}
              })
 
     assert settings.tracker.api_key == nil
     assert settings.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
+    assert settings.studio_runner.signing_secret == nil
 
     assert settings.codex.approval_policy == %{
              "reject" => %{"sandbox_approval" => true}
