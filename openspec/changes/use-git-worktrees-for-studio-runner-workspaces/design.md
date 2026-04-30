@@ -112,6 +112,10 @@ If PR state cannot be checked because auth/tooling is missing, cleanup should no
 - Never claim an arbitrary directory as reusable just because it is inactive.
 - Prefer rejecting a new run over contaminating it with unknown workspace state.
 
+## Agent Skills
+
+When the source repository contains repo-local Codex skills under `.codex/skills`, Symphony should copy those skills into the managed worktree before launching Codex. This lets OpenSpec Studio provide a repository-specific GitHub CLI skill alongside the OpenSpec skills, so the unattended agent can publish its own branch and PR with `git`/`gh` rather than falling back to connector/MCP PR creation.
+
 ## Studio Responsibilities
 
 OpenSpec Studio should not implement worktree creation. Studio may later display:

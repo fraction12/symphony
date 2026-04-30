@@ -16,6 +16,7 @@
 - [x] Ensure Codex cwd is the worktree path, never the original repo path.
 - [x] Reject or safely handle branch/worktree conflicts.
 - [x] Preserve same-event retry behavior without creating duplicate worktrees.
+- [x] Copy repo-local Codex skills into Studio Runner worktrees before agent launch.
 
 ## Lifecycle metadata
 

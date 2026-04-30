@@ -33,6 +33,9 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
     )
 
     File.write!(Path.join(source_repo, "ORIGINAL"), "untouched")
+    File.mkdir_p!(Path.join(source_repo, ".codex/skills/github"))
+    File.write!(Path.join(source_repo, ".codex/skills/github/SKILL.md"), "# GitHub CLI
+")
     remote_repo = Path.join(test_root, "remote.git")
     System.cmd("git", ["init", "--bare", "--quiet", remote_repo])
     System.cmd("git", ["init", "--quiet"], cd: source_repo)
@@ -93,6 +96,10 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
            )
 
     assert File.exists?(Path.join(context.workspace_path, ".symphony-studio-runner.json"))
+
+    assert File.read!(Path.join(context.workspace_path, ".codex/skills/github/SKILL.md")) ==
+             "# GitHub CLI
+"
 
     assert {"true
 ", 0} =
@@ -184,7 +191,8 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
       change: change
     }
 
-    assert {:ok, lifecycle} = Executor.prepare_worktree_workspace(source_repo, git_source, work_item)
+    assert {:ok, lifecycle} =
+             Executor.prepare_worktree_workspace(source_repo, git_source, work_item)
 
     assert %{cleanupStatus: "blocked", cleanupError: active_error} =
              Executor.remove_worktree(source_repo, lifecycle.workspace_path)
@@ -192,7 +200,10 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
     assert active_error =~ "workspace_active"
 
     File.rm!(Path.join(lifecycle.workspace_path, ".symphony-studio-runner.json"))
-    assert %{cleanupStatus: "cleaned"} = Executor.remove_worktree(source_repo, lifecycle.workspace_path)
+
+    assert %{cleanupStatus: "cleaned"} =
+             Executor.remove_worktree(source_repo, lifecycle.workspace_path)
+
     refute File.exists?(lifecycle.workspace_path)
 
     assert %{cleanupStatus: "blocked", cleanupError: error} =
@@ -259,7 +270,10 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
 
   test "publication inspection reports completed only when a pull request exists" do
     test_root =
-      Path.join(System.tmp_dir!(), "studio-runner-publication-#{System.unique_integer([:positive])}")
+      Path.join(
+        System.tmp_dir!(),
+        "studio-runner-publication-#{System.unique_integer([:positive])}"
+      )
 
     workspace = Path.join(test_root, "workspace")
     File.mkdir_p!(workspace)
@@ -337,7 +351,10 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
 
   test "publication inspection blocks unchanged workspace at dispatch commit" do
     test_root =
-      Path.join(System.tmp_dir!(), "studio-runner-unchanged-#{System.unique_integer([:positive])}")
+      Path.join(
+        System.tmp_dir!(),
+        "studio-runner-unchanged-#{System.unique_integer([:positive])}"
+      )
 
     workspace = Path.join(test_root, "workspace")
     File.mkdir_p!(workspace)
@@ -367,7 +384,10 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
 
   test "publication inspection blocks work on the wrong branch" do
     test_root =
-      Path.join(System.tmp_dir!(), "studio-runner-wrong-branch-#{System.unique_integer([:positive])}")
+      Path.join(
+        System.tmp_dir!(),
+        "studio-runner-wrong-branch-#{System.unique_integer([:positive])}"
+      )
 
     workspace = Path.join(test_root, "workspace")
     File.mkdir_p!(workspace)
@@ -455,14 +475,24 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
     end
   end
 
-  defp eventually_snapshot(orchestrator_name, _predicate, 0), do: Orchestrator.snapshot(orchestrator_name, 1_000)
+  defp eventually_snapshot(orchestrator_name, _predicate, 0),
+    do: Orchestrator.snapshot(orchestrator_name, 1_000)
 
   defp create_source_repo!(source_repo, test_root, change) do
     File.mkdir_p!(Path.join(source_repo, "openspec/changes/#{change}/specs/runner"))
     File.write!(Path.join(source_repo, "openspec/changes/#{change}/proposal.md"), "# Proposal\n")
-    File.write!(Path.join(source_repo, "openspec/changes/#{change}/tasks.md"), "## Tasks\n- [ ] Do it\n")
+
+    File.write!(
+      Path.join(source_repo, "openspec/changes/#{change}/tasks.md"),
+      "## Tasks\n- [ ] Do it\n"
+    )
+
     File.write!(Path.join(source_repo, "openspec/changes/#{change}/design.md"), "# Design\n")
-    File.write!(Path.join(source_repo, "openspec/changes/#{change}/specs/runner/spec.md"), "## ADDED Requirements\n")
+
+    File.write!(
+      Path.join(source_repo, "openspec/changes/#{change}/specs/runner/spec.md"),
+      "## ADDED Requirements\n"
+    )
 
     remote_repo = Path.join(test_root, "remote.git")
     System.cmd("git", ["init", "--bare", "--quiet", remote_repo])

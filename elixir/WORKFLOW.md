@@ -34,6 +34,7 @@ codex:
   thread_sandbox: workspace-write
   turn_sandbox_policy:
     type: workspaceWrite
+    networkAccess: true
 studio_runner:
   signing_secret: $STUDIO_RUNNER_SIGNING_SECRET
   replay_window_seconds: 300

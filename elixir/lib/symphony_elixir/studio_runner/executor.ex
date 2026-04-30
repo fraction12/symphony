@@ -49,7 +49,9 @@ defmodule SymphonyElixir.StudioRunner.Executor do
 
   @spec run(WorkItem.t()) :: {:ok, map()} | {:error, term()}
   def run(%WorkItem{} = work_item) do
-    Logger.info("Starting Studio Runner execution event_id=#{work_item.event_id} run_id=#{work_item.run_id || "n/a"} repo_path=#{work_item.repo_path} change=#{work_item.change}")
+    Logger.info(
+      "Starting Studio Runner execution event_id=#{work_item.event_id} run_id=#{work_item.run_id || "n/a"} repo_path=#{work_item.repo_path} change=#{work_item.change}"
+    )
 
     case execute(work_item) do
       {:ok, context, result} ->
@@ -62,7 +64,9 @@ defmodule SymphonyElixir.StudioRunner.Executor do
         {:ok, metadata}
 
       {:error, reason} ->
-        Logger.error("Studio Runner execution failed event_id=#{work_item.event_id} run_id=#{work_item.run_id || "n/a"} reason=#{inspect(reason)}")
+        Logger.error(
+          "Studio Runner execution failed event_id=#{work_item.event_id} run_id=#{work_item.run_id || "n/a"} reason=#{inspect(reason)}"
+        )
 
         {:error, reason}
     end
@@ -186,7 +190,8 @@ defmodule SymphonyElixir.StudioRunner.Executor do
              git_source.remote_ref,
              work_item
            ),
-         :ok <- write_worktree_marker(workspace_path, lifecycle) do
+         :ok <- write_worktree_marker(workspace_path, lifecycle),
+         :ok <- copy_repo_codex_skills(source_repo, workspace_path) do
       {:ok, lifecycle}
     end
   end
@@ -240,6 +245,19 @@ defmodule SymphonyElixir.StudioRunner.Executor do
     }
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.new()
+  end
+
+  defp copy_repo_codex_skills(source_repo, workspace_path) do
+    source_skills = Path.join(source_repo, ".codex/skills")
+    destination_skills = Path.join(workspace_path, ".codex/skills")
+
+    if File.dir?(source_skills) do
+      File.mkdir_p!(Path.dirname(destination_skills))
+      File.rm_rf!(destination_skills)
+      File.cp_r!(source_skills, destination_skills)
+    end
+
+    :ok
   end
 
   defp validate_change_name(change) when is_binary(change) do
@@ -363,7 +381,8 @@ defmodule SymphonyElixir.StudioRunner.Executor do
   defp validate_worktree_cleanup_path(source_repo, workspace_path) do
     with :ok <- validate_worktree_workspace_path(workspace_path, source_repo),
          {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace_path),
-         true <- File.dir?(canonical_workspace) || {:error, {:workspace_missing, canonical_workspace}},
+         true <-
+           File.dir?(canonical_workspace) || {:error, {:workspace_missing, canonical_workspace}},
          :ok <- ensure_inactive_worktree(canonical_workspace) do
       :ok
     end
@@ -692,9 +711,10 @@ defmodule SymphonyElixir.StudioRunner.Executor do
     4. Update `openspec/changes/#{context.change}/tasks.md` only for work actually completed.
     5. Run targeted validation/tests and record the evidence.
     6. Commit completed work on `#{context.branch_name}`.
-    7. Push the branch and open a pull request using normal repo/GitHub tooling when auth/tools permit.
-    8. If push or PR creation is blocked by missing auth/tooling, stop as blocked. Do not call local-only changes complete.
-    9. Final response must include status, validation evidence, commit SHA when available, and PR URL when available.
+    7. Use the repo-local GitHub CLI skill when available, push the branch with `git`, and create the pull request with non-interactive `gh pr create`.
+    8. Do not use GitHub connector/MCP tools for pull request creation; unattended connector elicitation can block the runner.
+    9. If push or `gh` PR creation is blocked by missing auth/tooling/network, stop as blocked. Do not call local-only changes complete.
+    10. Final response must include status, validation evidence, commit SHA when available, and PR URL when available.
 
     OpenSpec proposal:
     #{context.artifacts.proposal || "No proposal.md found."}
