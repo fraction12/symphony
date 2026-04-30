@@ -33,12 +33,17 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
     )
 
     File.write!(Path.join(source_repo, "ORIGINAL"), "untouched")
+    remote_repo = Path.join(test_root, "remote.git")
+    System.cmd("git", ["init", "--bare", "--quiet", remote_repo])
     System.cmd("git", ["init", "--quiet"], cd: source_repo)
     System.cmd("git", ["checkout", "-B", "main", "--quiet"], cd: source_repo)
     System.cmd("git", ["config", "user.email", "test@example.com"], cd: source_repo)
     System.cmd("git", ["config", "user.name", "Test User"], cd: source_repo)
     System.cmd("git", ["add", "."], cd: source_repo)
     System.cmd("git", ["commit", "-m", "initial"], cd: source_repo)
+    System.cmd("git", ["remote", "add", "origin", remote_repo], cd: source_repo)
+    System.cmd("git", ["push", "-u", "origin", "main"], cd: source_repo)
+    System.cmd("git", ["remote", "set-head", "origin", "main"], cd: source_repo)
 
     write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
 
@@ -67,7 +72,7 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
                  {:ok,
                   %{
                     status: "completed",
-                    branch_name: "studio-runner/add-runner-work/evtexecute",
+                    branch_name: "studio-runner/add-runner-work/executetest",
                     commit_sha: "0123456789abcdef0123456789abcdef01234567",
                     pr_url: "https://github.com/example/source/pull/123"
                   }}
@@ -76,26 +81,135 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
 
     assert context.change == "add-runner-work"
     assert context.workspace_path != source_repo
+    assert context.branch_name == "studio-runner/add-runner-work/executetest"
+    assert context.base_commit_sha =~ ~r/^[0-9a-f]{40}$/
 
     assert {:ok, canonical_workspace_root} =
              SymphonyElixir.PathSafety.canonicalize(workspace_root)
 
-    assert String.starts_with?(context.workspace_path, canonical_workspace_root <> "/")
+    assert String.starts_with?(
+             context.workspace_path,
+             Path.join([canonical_workspace_root, "runs", "source", "add-runner-work"]) <> "/"
+           )
+
+    assert File.exists?(Path.join(context.workspace_path, ".symphony-studio-runner.json"))
+
+    assert {"true
+", 0} =
+             System.cmd("git", ["rev-parse", "--is-inside-work-tree"], cd: context.workspace_path)
+
     assert result.session_id == "session-test"
     assert result.status == "completed"
     assert result.pr_url == "https://github.com/example/source/pull/123"
+    assert context.base_commit_sha =~ ~r/^[0-9a-f]{40}$/
 
     assert_receive {:codex_invoked, workspace, prompt, ^work_item}, 500
     assert workspace == context.workspace_path
     assert prompt =~ "OpenSpec change"
     assert prompt =~ "add-runner-work"
-    assert prompt =~ "studio-runner/add-runner-work/evtexecute"
+    assert prompt =~ "studio-runner/add-runner-work/executetest"
     assert File.exists?(Path.join(workspace, "WORKSPACE_ONLY"))
     refute File.exists?(Path.join(source_repo, "WORKSPACE_ONLY"))
     assert File.read!(Path.join(source_repo, "ORIGINAL")) == "untouched"
+    assert {"main
+", 0} = System.cmd("git", ["branch", "--show-current"], cd: source_repo)
     File.rm_rf!(test_root)
 
     :ok
+  end
+
+  test "same event retry reuses its existing worktree but new events do not" do
+    test_root =
+      Path.join(System.tmp_dir!(), "studio-runner-retry-#{System.unique_integer([:positive])}")
+
+    source_repo = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    change = "retry-work"
+    create_source_repo!(source_repo, test_root, change)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    git_source = %{
+      remote_name: "origin",
+      remote_url: Path.join(test_root, "remote.git"),
+      default_branch: "main",
+      remote_ref: "origin/main"
+    }
+
+    work_item = %WorkItem{
+      event_id: "evt-retry-test",
+      run_id: "run_retry_test",
+      event_type: "build.requested",
+      repo_path: source_repo,
+      repo_name: "source",
+      change: change
+    }
+
+    assert {:ok, first} = Executor.prepare_worktree_workspace(source_repo, git_source, work_item)
+    File.write!(Path.join(first.workspace_path, "RETRY_MARKER"), "keep")
+    assert {:ok, second} = Executor.prepare_worktree_workspace(source_repo, git_source, work_item)
+    assert second.workspace_path == first.workspace_path
+    assert File.read!(Path.join(second.workspace_path, "RETRY_MARKER")) == "keep"
+
+    new_event = %{work_item | event_id: "evt-retry-test-two", run_id: "run_retry_test_two"}
+    assert {:ok, third} = Executor.prepare_worktree_workspace(source_repo, git_source, new_event)
+    assert third.workspace_path != first.workspace_path
+    refute File.exists?(Path.join(third.workspace_path, "RETRY_MARKER"))
+
+    File.rm_rf!(test_root)
+  end
+
+  test "worktree cleanup refuses source and outside-root paths while removing known worktrees" do
+    test_root =
+      Path.join(System.tmp_dir!(), "studio-runner-cleanup-#{System.unique_integer([:positive])}")
+
+    source_repo = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    change = "cleanup-work"
+    create_source_repo!(source_repo, test_root, change)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    git_source = %{
+      remote_name: "origin",
+      remote_url: Path.join(test_root, "remote.git"),
+      default_branch: "main",
+      remote_ref: "origin/main"
+    }
+
+    work_item = %WorkItem{
+      event_id: "evt-cleanup-test",
+      run_id: "run_cleanup_test",
+      event_type: "build.requested",
+      repo_path: source_repo,
+      repo_name: "source",
+      change: change
+    }
+
+    assert {:ok, lifecycle} = Executor.prepare_worktree_workspace(source_repo, git_source, work_item)
+
+    assert %{cleanupStatus: "blocked", cleanupError: active_error} =
+             Executor.remove_worktree(source_repo, lifecycle.workspace_path)
+
+    assert active_error =~ "workspace_active"
+
+    File.rm!(Path.join(lifecycle.workspace_path, ".symphony-studio-runner.json"))
+    assert %{cleanupStatus: "cleaned"} = Executor.remove_worktree(source_repo, lifecycle.workspace_path)
+    refute File.exists?(lifecycle.workspace_path)
+
+    assert %{cleanupStatus: "blocked", cleanupError: error} =
+             Executor.remove_worktree(source_repo, source_repo)
+
+    assert error =~ "workspace_equals_source_repo"
+
+    outside = Path.join(test_root, "outside-worktree")
+    File.mkdir_p!(outside)
+
+    assert %{cleanupStatus: "blocked", cleanupError: outside_error} =
+             Executor.remove_worktree(source_repo, outside)
+
+    assert outside_error =~ "workspace_outside_root"
+    assert File.dir?(outside)
+
+    File.rm_rf!(test_root)
   end
 
   test "orchestrator status captures blocked Studio Runner execution metadata" do
@@ -293,12 +407,17 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
       "# Proposal\n"
     )
 
+    remote_repo = Path.join(test_root, "remote.git")
+    System.cmd("git", ["init", "--bare", "--quiet", remote_repo])
     System.cmd("git", ["init", "--quiet"], cd: source_repo)
     System.cmd("git", ["checkout", "-B", "main", "--quiet"], cd: source_repo)
     System.cmd("git", ["config", "user.email", "test@example.com"], cd: source_repo)
     System.cmd("git", ["config", "user.name", "Test User"], cd: source_repo)
     System.cmd("git", ["add", "."], cd: source_repo)
     System.cmd("git", ["commit", "-m", "initial"], cd: source_repo)
+    System.cmd("git", ["remote", "add", "origin", remote_repo], cd: source_repo)
+    System.cmd("git", ["push", "-u", "origin", "main"], cd: source_repo)
+    System.cmd("git", ["remote", "set-head", "origin", "main"], cd: source_repo)
 
     write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
 
@@ -337,4 +456,24 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
   end
 
   defp eventually_snapshot(orchestrator_name, _predicate, 0), do: Orchestrator.snapshot(orchestrator_name, 1_000)
+
+  defp create_source_repo!(source_repo, test_root, change) do
+    File.mkdir_p!(Path.join(source_repo, "openspec/changes/#{change}/specs/runner"))
+    File.write!(Path.join(source_repo, "openspec/changes/#{change}/proposal.md"), "# Proposal\n")
+    File.write!(Path.join(source_repo, "openspec/changes/#{change}/tasks.md"), "## Tasks\n- [ ] Do it\n")
+    File.write!(Path.join(source_repo, "openspec/changes/#{change}/design.md"), "# Design\n")
+    File.write!(Path.join(source_repo, "openspec/changes/#{change}/specs/runner/spec.md"), "## ADDED Requirements\n")
+
+    remote_repo = Path.join(test_root, "remote.git")
+    System.cmd("git", ["init", "--bare", "--quiet", remote_repo])
+    System.cmd("git", ["init", "--quiet"], cd: source_repo)
+    System.cmd("git", ["checkout", "-B", "main", "--quiet"], cd: source_repo)
+    System.cmd("git", ["config", "user.email", "test@example.com"], cd: source_repo)
+    System.cmd("git", ["config", "user.name", "Test User"], cd: source_repo)
+    System.cmd("git", ["add", "."], cd: source_repo)
+    System.cmd("git", ["commit", "-m", "initial"], cd: source_repo)
+    System.cmd("git", ["remote", "add", "origin", remote_repo], cd: source_repo)
+    System.cmd("git", ["push", "-u", "origin", "main"], cd: source_repo)
+    System.cmd("git", ["remote", "set-head", "origin", "main"], cd: source_repo)
+  end
 end

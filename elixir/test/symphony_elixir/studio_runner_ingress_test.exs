@@ -332,7 +332,12 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
          sessionId: "session-demo",
          branchName: "studio-runner/introduce-studio-runner",
          commitSha: "abc1234",
-         prUrl: "https://github.com/fraction12/openspec-studio/pull/1"
+         prUrl: "https://github.com/fraction12/openspec-studio/pull/1",
+         sourceRepoPath: repo_path,
+         baseCommitSha: "base1234",
+         workspaceStatus: "published",
+         cleanupEligible: true,
+         cleanupReason: "published"
        }}
     end
 
@@ -358,6 +363,8 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
     assert conn.resp_body =~ "session-demo"
     assert conn.resp_body =~ "abc1234"
     assert conn.resp_body =~ "https://github.com/fraction12/openspec-studio/pull/1"
+    assert conn.resp_body =~ "base1234"
+    assert conn.resp_body =~ "cleanupEligible"
     refute conn.resp_body =~ "proposal.md contents"
   end
 

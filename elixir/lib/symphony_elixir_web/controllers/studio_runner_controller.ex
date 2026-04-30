@@ -210,6 +210,15 @@ defmodule SymphonyElixirWeb.StudioRunnerController do
       branchName: Map.get(event, :branchName) || Map.get(event, "branchName"),
       commitSha: Map.get(event, :commitSha) || Map.get(event, "commitSha"),
       prUrl: Map.get(event, :prUrl) || Map.get(event, "prUrl"),
+      sourceRepoPath: Map.get(event, :sourceRepoPath) || Map.get(event, "sourceRepoPath"),
+      baseCommitSha: Map.get(event, :baseCommitSha) || Map.get(event, "baseCommitSha"),
+      workspaceStatus: Map.get(event, :workspaceStatus) || Map.get(event, "workspaceStatus"),
+      workspaceCreatedAt: Map.get(event, :workspaceCreatedAt) || Map.get(event, "workspaceCreatedAt"),
+      workspaceUpdatedAt: Map.get(event, :workspaceUpdatedAt) || Map.get(event, "workspaceUpdatedAt"),
+      cleanupEligible: Map.get(event, :cleanupEligible) || Map.get(event, "cleanupEligible"),
+      cleanupReason: Map.get(event, :cleanupReason) || Map.get(event, "cleanupReason"),
+      cleanupStatus: Map.get(event, :cleanupStatus) || Map.get(event, "cleanupStatus"),
+      cleanupError: Map.get(event, :cleanupError) || Map.get(event, "cleanupError"),
       error: Map.get(event, :error) || Map.get(event, "error")
     }
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)

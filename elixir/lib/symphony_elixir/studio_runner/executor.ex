@@ -3,7 +3,7 @@ defmodule SymphonyElixir.StudioRunner.Executor do
   Executes accepted Studio Runner OpenSpec work.
 
   The signed ingress path owns verification, idempotency, and async dispatch. This
-  module turns the accepted work item into a Symphony-managed workspace plus a
+  module turns the accepted work item into a Symphony-managed Git worktree plus a
   Codex app-server run. Studio Runner work stays OpenSpec-native: it does not
   require Linear credentials or tracker state.
   """
@@ -17,18 +17,34 @@ defmodule SymphonyElixir.StudioRunner.Executor do
   @required_artifacts ["proposal.md", "tasks.md"]
   @max_artifact_bytes 64_000
   @git_command_timeout_ms 15_000
+  @cleanup_error_max_bytes 1_024
+  @debug_retention_seconds 7 * 24 * 60 * 60
+  @abandoned_retention_seconds 3 * 24 * 60 * 60
 
   @type execution_context :: %{
           event_id: String.t(),
           run_id: String.t() | nil,
           repo_path: Path.t(),
+          repo_name: String.t(),
+          repo_remote: String.t() | nil,
           workspace_path: Path.t(),
           change: String.t(),
           branch_name: String.t(),
           artifacts: map(),
           validation: map(),
           git_ref: String.t() | nil,
-          base_commit_sha: String.t() | nil
+          base_commit_sha: String.t() | nil,
+          requested_by: String.t() | nil,
+          workspace_lifecycle: map()
+        }
+
+  @type cleanup_metadata :: %{
+          required(:workspacePath) => Path.t(),
+          optional(:status) => String.t(),
+          optional(:cleanupEligible) => boolean(),
+          optional(:cleanupReason) => String.t(),
+          optional(:cleanupError) => String.t(),
+          optional(:cleanupStatus) => String.t()
         }
 
   @spec run(WorkItem.t()) :: {:ok, map()} | {:error, term()}
@@ -40,7 +56,7 @@ defmodule SymphonyElixir.StudioRunner.Executor do
         metadata = execution_metadata(context, result)
 
         Logger.info(
-          "Studio Runner execution completed event_id=#{work_item.event_id} run_id=#{work_item.run_id || "n/a"} workspace=#{context.workspace_path} session_id=#{metadata[:session_id] || "n/a"} status=#{metadata[:status]}"
+          "Studio Runner execution completed event_id=#{work_item.event_id} run_id=#{work_item.run_id || "n/a"} workspace=#{context.workspace_path} session_id=#{metadata[:sessionId] || "n/a"} status=#{metadata[:status]}"
         )
 
         {:ok, metadata}
@@ -56,11 +72,13 @@ defmodule SymphonyElixir.StudioRunner.Executor do
   def execute(%WorkItem{} = work_item, opts \\ []) do
     with {:ok, source_repo} <- canonical_source_repo(work_item.repo_path),
          :ok <- validate_change_name(work_item.change),
-         {:ok, workspace} <- create_workspace(work_item, opts),
-         :ok <- prepare_workspace(source_repo, workspace, opts),
+         {:ok, git_source} <- source_repo_git_metadata(source_repo, work_item, opts),
+         {:ok, workspace_lifecycle} <-
+           prepare_worktree_workspace(source_repo, git_source, work_item, opts),
+         workspace <- workspace_lifecycle.workspace_path,
          :ok <- Workspace.run_before_run_hook(workspace, hook_context(work_item), nil),
          {:ok, artifacts} <- load_change_artifacts(workspace, work_item.change),
-         context <- build_context(work_item, source_repo, workspace, artifacts),
+         context <- build_context(work_item, source_repo, workspace_lifecycle, artifacts),
          prompt <- build_prompt(context) do
       try do
         with {:ok, codex_result} <- run_codex(workspace, prompt, work_item, opts),
@@ -83,13 +101,146 @@ defmodule SymphonyElixir.StudioRunner.Executor do
          true <- File.dir?(repo_path) || {:error, {:invalid_repo_path, :missing_directory}},
          {:ok, canonical_repo} <- PathSafety.canonicalize(repo_path),
          true <-
-           File.dir?(Path.join(canonical_repo, ".git")) ||
+           git_repo?(canonical_repo) ||
              {:error, {:invalid_repo_path, :missing_git_dir}} do
       {:ok, canonical_repo}
     end
   end
 
   def canonical_source_repo(_repo_path), do: {:error, {:invalid_repo_path, :not_string}}
+
+  @spec source_repo_git_metadata(Path.t(), WorkItem.t(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def source_repo_git_metadata(source_repo, %WorkItem{} = work_item, opts \\ [])
+      when is_binary(source_repo) do
+    discover_fun = Keyword.get(opts, :discover_git_source, &discover_git_source/2)
+    discover_fun.(source_repo, work_item)
+  end
+
+  @spec discover_git_source(Path.t(), WorkItem.t()) :: {:ok, map()} | {:error, term()}
+  def discover_git_source(source_repo, %WorkItem{} = work_item) when is_binary(source_repo) do
+    remote_name = "origin"
+
+    with {:ok, repo_root} <- git_output(source_repo, ["rev-parse", "--show-toplevel"]),
+         {:ok, canonical_root} <- PathSafety.canonicalize(repo_root),
+         true <-
+           canonical_root == source_repo ||
+             {:error, {:repo_path_not_git_root, source_repo, canonical_root}},
+         {:ok, remote_url} <- source_remote_url(source_repo, remote_name, work_item),
+         {:ok, default_branch} <- source_default_branch(source_repo, remote_name) do
+      {:ok,
+       %{
+         source_repo: source_repo,
+         remote_name: remote_name,
+         remote_url: remote_url,
+         default_branch: default_branch,
+         remote_ref: "#{remote_name}/#{default_branch}",
+         current_commit: current_commit(source_repo)
+       }}
+    end
+  end
+
+  @spec fetch_source_remote(Path.t(), map(), keyword()) :: :ok | {:error, term()}
+  def fetch_source_remote(source_repo, git_source, opts \\ [])
+      when is_binary(source_repo) and is_map(git_source) do
+    fetch_fun = Keyword.get(opts, :fetch_remote, &default_fetch_remote/2)
+    fetch_fun.(source_repo, git_source)
+  end
+
+  @spec default_fetch_remote(Path.t(), map()) :: :ok | {:error, term()}
+  def default_fetch_remote(source_repo, %{remote_name: remote_name})
+      when is_binary(remote_name) do
+    case run_git(source_repo, ["fetch", remote_name]) do
+      {:ok, _output} -> :ok
+      {:error, reason} -> {:error, {:source_fetch_failed, reason}}
+    end
+  end
+
+  @spec prepare_worktree_workspace(Path.t(), map(), WorkItem.t(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def prepare_worktree_workspace(source_repo, git_source, %WorkItem{} = work_item, opts \\ []) do
+    with :ok <- fetch_source_remote(source_repo, git_source, opts),
+         {:ok, workspace_path} <- studio_runner_workspace_path(work_item),
+         :ok <- validate_worktree_workspace_path(workspace_path, source_repo),
+         {:ok, base_commit_sha} <- git_output(source_repo, ["rev-parse", git_source.remote_ref]),
+         branch_name <- branch_name(work_item),
+         lifecycle <- %{
+           event_id: work_item.event_id,
+           run_id: work_item.run_id,
+           repo_path: source_repo,
+           repo_name: work_item.repo_name || Path.basename(source_repo),
+           change_name: work_item.change,
+           workspace_path: workspace_path,
+           branch_name: branch_name,
+           base_ref: git_source.remote_ref,
+           base_commit_sha: base_commit_sha,
+           status: "active",
+           created_at: DateTime.utc_now(),
+           updated_at: DateTime.utc_now()
+         },
+         :ok <-
+           create_or_reuse_worktree(
+             source_repo,
+             workspace_path,
+             branch_name,
+             git_source.remote_ref,
+             work_item
+           ),
+         :ok <- write_worktree_marker(workspace_path, lifecycle) do
+      {:ok, lifecycle}
+    end
+  end
+
+  @spec remove_worktree(Path.t(), Path.t()) :: cleanup_metadata()
+  def remove_worktree(source_repo, workspace_path)
+      when is_binary(source_repo) and is_binary(workspace_path) do
+    with {:ok, canonical_source} <- canonical_source_repo(source_repo),
+         :ok <- validate_worktree_cleanup_path(canonical_source, workspace_path),
+         :ok <- ensure_registered_worktree(canonical_source, workspace_path) do
+      case run_git(canonical_source, ["worktree", "remove", workspace_path]) do
+        {:ok, _output} ->
+          prune_worktrees(canonical_source)
+          %{workspacePath: workspace_path, cleanupStatus: "cleaned"}
+
+        {:error, {_command, _status, output} = reason} ->
+          metadata = cleanup_error_metadata(workspace_path, {:worktree_remove_failed, reason})
+
+          if missing_worktree_output?(output) do
+            prune_worktrees(canonical_source)
+          end
+
+          metadata
+
+        {:error, reason} ->
+          cleanup_error_metadata(workspace_path, {:worktree_remove_failed, reason})
+      end
+    else
+      {:error, reason} -> cleanup_error_metadata(workspace_path, reason)
+    end
+  end
+
+  @spec cleanup_metadata(map(), DateTime.t()) :: cleanup_metadata()
+  def cleanup_metadata(event_metadata, now \\ DateTime.utc_now()) when is_map(event_metadata) do
+    workspace_path =
+      Map.get(event_metadata, :workspacePath) || Map.get(event_metadata, "workspacePath")
+
+    status = Map.get(event_metadata, :status) || Map.get(event_metadata, "status")
+    pr_url = Map.get(event_metadata, :prUrl) || Map.get(event_metadata, "prUrl")
+
+    updated_at =
+      Map.get(event_metadata, :updatedAt) || Map.get(event_metadata, "updatedAt") || now
+
+    {eligible?, reason} = cleanup_eligibility(status, pr_url, updated_at, now)
+
+    %{
+      workspacePath: workspace_path,
+      status: status,
+      cleanupEligible: eligible?,
+      cleanupReason: reason
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
 
   defp validate_change_name(change) when is_binary(change) do
     if Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9._-]*$/, change) do
@@ -101,36 +252,318 @@ defmodule SymphonyElixir.StudioRunner.Executor do
 
   defp validate_change_name(change), do: {:error, {:invalid_change_name, change}}
 
-  defp create_workspace(%WorkItem{} = work_item, opts) do
-    workspace_id = workspace_identifier(work_item)
-    create_workspace_fun = Keyword.get(opts, :create_workspace, &Workspace.create_for_issue/1)
-    create_workspace_fun.(%{id: work_item.event_id, identifier: workspace_id})
+  defp git_repo?(repo_path) do
+    File.dir?(Path.join(repo_path, ".git")) or File.exists?(Path.join(repo_path, ".git"))
   end
 
-  defp workspace_identifier(%WorkItem{} = work_item) do
-    [
-      "studio-runner",
-      safe_identifier(work_item.repo_name || Path.basename(work_item.repo_path)),
-      safe_identifier(work_item.change),
-      safe_identifier(work_item.run_id || work_item.event_id)
-    ]
-    |> Enum.join("-")
-  end
-
-  defp prepare_workspace(source_repo, workspace, opts) do
-    prepare_fun = Keyword.get(opts, :prepare_workspace, &copy_repo_to_workspace/2)
-    prepare_fun.(source_repo, workspace)
-  end
-
-  @spec copy_repo_to_workspace(Path.t(), Path.t()) :: :ok | {:error, term()}
-  def copy_repo_to_workspace(source_repo, workspace) do
-    File.rm_rf!(workspace)
-    File.mkdir_p!(Path.dirname(workspace))
-
-    case System.cmd("git", ["clone", "--no-hardlinks", source_repo, workspace], stderr_to_stdout: true) do
-      {_output, 0} -> :ok
-      {output, status} -> {:error, {:workspace_clone_failed, status, bounded_output(output)}}
+  defp source_remote_url(source_repo, remote_name, %WorkItem{repo_remote: repo_remote}) do
+    case git_output(source_repo, ["remote", "get-url", remote_name]) do
+      {:ok, remote_url} -> {:ok, remote_url}
+      {:error, reason} -> fallback_remote_url(repo_remote, reason)
     end
+  end
+
+  defp fallback_remote_url(repo_remote, _reason) when is_binary(repo_remote) do
+    case String.trim(repo_remote) do
+      "" -> {:error, {:missing_remote, "origin"}}
+      remote_url -> {:ok, remote_url}
+    end
+  end
+
+  defp fallback_remote_url(_repo_remote, reason),
+    do: {:error, {:missing_remote, "origin", reason}}
+
+  defp source_default_branch(source_repo, remote_name) do
+    case git_output(source_repo, [
+           "symbolic-ref",
+           "--quiet",
+           "--short",
+           "refs/remotes/#{remote_name}/HEAD"
+         ]) do
+      {:ok, remote_head} ->
+        remote_prefix = remote_name <> "/"
+
+        if String.starts_with?(remote_head, remote_prefix) do
+          {:ok, String.replace_prefix(remote_head, remote_prefix, "")}
+        else
+          {:ok, remote_head}
+        end
+
+      {:error, _reason} ->
+        case git_output(source_repo, ["remote", "show", remote_name]) do
+          {:ok, output} -> parse_remote_show_head(output)
+          {:error, reason} -> fallback_default_branch(source_repo, reason)
+        end
+    end
+  end
+
+  defp parse_remote_show_head(output) when is_binary(output) do
+    output
+    |> String.split("\n")
+    |> Enum.find_value(fn line ->
+      case Regex.run(~r/HEAD branch:\s*(\S+)/, line) do
+        [_, branch] -> branch
+        _ -> nil
+      end
+    end)
+    |> case do
+      nil -> {:error, :missing_remote_default_branch}
+      branch -> {:ok, branch}
+    end
+  end
+
+  defp fallback_default_branch(source_repo, reason) do
+    cond do
+      match?({:ok, _}, git_output(source_repo, ["rev-parse", "--verify", "origin/main"])) ->
+        {:ok, "main"}
+
+      match?({:ok, _}, git_output(source_repo, ["rev-parse", "--verify", "origin/master"])) ->
+        {:ok, "master"}
+
+      true ->
+        {:error, {:missing_remote_default_branch, reason}}
+    end
+  end
+
+  defp studio_runner_workspace_path(%WorkItem{} = work_item) do
+    root = Config.settings!().workspace.root
+
+    workspace =
+      root
+      |> Path.join("runs")
+      |> Path.join(safe_identifier(work_item.repo_name || Path.basename(work_item.repo_path)))
+      |> Path.join(safe_identifier(work_item.change))
+      |> Path.join(safe_identifier(work_item.run_id || work_item.event_id))
+
+    PathSafety.canonicalize(workspace)
+  end
+
+  defp validate_worktree_workspace_path(workspace_path, source_repo) do
+    with {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace_path),
+         {:ok, canonical_root} <- PathSafety.canonicalize(Config.settings!().workspace.root),
+         {:ok, canonical_source} <- PathSafety.canonicalize(source_repo) do
+      root_prefix = canonical_root <> "/"
+
+      cond do
+        canonical_workspace == canonical_root ->
+          {:error, {:workspace_equals_root, canonical_workspace}}
+
+        canonical_workspace == canonical_source ->
+          {:error, {:workspace_equals_source_repo, canonical_workspace}}
+
+        String.starts_with?(canonical_workspace <> "/", root_prefix) ->
+          :ok
+
+        true ->
+          {:error, {:workspace_outside_root, canonical_workspace, canonical_root}}
+      end
+    end
+  end
+
+  defp validate_worktree_cleanup_path(source_repo, workspace_path) do
+    with :ok <- validate_worktree_workspace_path(workspace_path, source_repo),
+         {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace_path),
+         true <- File.dir?(canonical_workspace) || {:error, {:workspace_missing, canonical_workspace}},
+         :ok <- ensure_inactive_worktree(canonical_workspace) do
+      :ok
+    end
+  end
+
+  defp ensure_inactive_worktree(workspace_path) do
+    case read_worktree_marker(workspace_path) do
+      {:ok, %{"status" => status}} when status in ["active", "running", "accepted"] ->
+        {:error, {:workspace_active, workspace_path}}
+
+      {:ok, _marker} ->
+        :ok
+
+      {:error, _reason} ->
+        :ok
+    end
+  end
+
+  defp create_or_reuse_worktree(
+         source_repo,
+         workspace_path,
+         branch_name,
+         remote_ref,
+         %WorkItem{} = work_item
+       ) do
+    cond do
+      File.dir?(workspace_path) ->
+        validate_existing_retry_worktree(
+          source_repo,
+          workspace_path,
+          branch_name,
+          remote_ref,
+          work_item
+        )
+
+      File.exists?(workspace_path) ->
+        {:error, {:workspace_path_conflict, workspace_path}}
+
+      branch_exists?(source_repo, branch_name) ->
+        {:error, {:branch_already_exists, branch_name}}
+
+      true ->
+        File.mkdir_p!(Path.dirname(workspace_path))
+        add_worktree(source_repo, workspace_path, branch_name, remote_ref)
+    end
+  end
+
+  defp validate_existing_retry_worktree(
+         source_repo,
+         workspace_path,
+         branch_name,
+         remote_ref,
+         %WorkItem{} = work_item
+       ) do
+    with :ok <- ensure_registered_worktree(source_repo, workspace_path),
+         {:ok, actual_branch} <- git_output(workspace_path, ["branch", "--show-current"]),
+         true <-
+           actual_branch == branch_name ||
+             {:error, {:workspace_branch_mismatch, actual_branch, branch_name}},
+         {:ok, marker} <- read_worktree_marker(workspace_path),
+         true <-
+           Map.get(marker, "event_id") == work_item.event_id ||
+             {:error, {:workspace_event_mismatch, workspace_path}},
+         true <-
+           Map.get(marker, "run_id") == work_item.run_id ||
+             {:error, {:workspace_run_mismatch, workspace_path}},
+         :ok <- ensure_worktree_base_available(workspace_path, remote_ref) do
+      :ok
+    end
+  end
+
+  defp add_worktree(source_repo, workspace_path, branch_name, remote_ref) do
+    case run_git(source_repo, ["worktree", "add", workspace_path, "-b", branch_name, remote_ref]) do
+      {:ok, _output} -> :ok
+      {:error, reason} -> {:error, {:worktree_create_failed, reason}}
+    end
+  end
+
+  defp ensure_worktree_base_available(workspace_path, remote_ref) do
+    case run_git(workspace_path, ["rev-parse", "--verify", remote_ref]) do
+      {:ok, _output} -> :ok
+      {:error, reason} -> {:error, {:worktree_base_unavailable, remote_ref, reason}}
+    end
+  end
+
+  defp write_worktree_marker(workspace_path, lifecycle) do
+    marker_path = Path.join(workspace_path, ".symphony-studio-runner.json")
+
+    payload = %{
+      event_id: lifecycle.event_id,
+      run_id: lifecycle.run_id,
+      repo_path: lifecycle.repo_path,
+      repo_name: lifecycle.repo_name,
+      change_name: lifecycle.change_name,
+      workspace_path: lifecycle.workspace_path,
+      branch_name: lifecycle.branch_name,
+      base_ref: lifecycle.base_ref,
+      base_commit_sha: lifecycle.base_commit_sha,
+      status: lifecycle.status,
+      created_at: DateTime.to_iso8601(lifecycle.created_at),
+      updated_at: DateTime.to_iso8601(lifecycle.updated_at)
+    }
+
+    File.write(marker_path, Jason.encode!(payload, pretty: true))
+  end
+
+  defp read_worktree_marker(workspace_path) do
+    marker_path = Path.join(workspace_path, ".symphony-studio-runner.json")
+
+    with {:ok, content} <- File.read(marker_path),
+         {:ok, payload} when is_map(payload) <- Jason.decode(content) do
+      {:ok, payload}
+    else
+      {:error, reason} -> {:error, {:workspace_marker_unreadable, reason}}
+      _ -> {:error, :workspace_marker_invalid}
+    end
+  end
+
+  defp ensure_registered_worktree(source_repo, workspace_path) do
+    with {:ok, output} <- git_output(source_repo, ["worktree", "list", "--porcelain"]),
+         {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace_path) do
+      registered? =
+        output
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "worktree "))
+        |> Enum.map(&String.replace_prefix(&1, "worktree ", ""))
+        |> Enum.any?(fn path ->
+          case PathSafety.canonicalize(path) do
+            {:ok, canonical_path} -> canonical_path == canonical_workspace
+            {:error, _reason} -> false
+          end
+        end)
+
+      if registered?, do: :ok, else: {:error, {:unknown_worktree, workspace_path}}
+    end
+  end
+
+  defp branch_exists?(source_repo, branch_name) do
+    match?(
+      {:ok, _},
+      git_output(source_repo, ["show-ref", "--verify", "refs/heads/#{branch_name}"])
+    )
+  end
+
+  defp prune_worktrees(source_repo) do
+    case run_git(source_repo, ["worktree", "prune"]) do
+      {:ok, _output} -> :ok
+      {:error, reason} -> {:error, {:worktree_prune_failed, reason}}
+    end
+  end
+
+  defp cleanup_error_metadata(workspace_path, reason) do
+    %{
+      workspacePath: workspace_path,
+      cleanupStatus: "blocked",
+      cleanupError: bounded_output(inspect(reason), @cleanup_error_max_bytes)
+    }
+  end
+
+  defp cleanup_eligibility(status, pr_url, updated_at, now) do
+    cond do
+      status in ["running", "accepted"] ->
+        {false, "active"}
+
+      status == "completed" and is_binary(pr_url) and pr_url != "" ->
+        {true, "published"}
+
+      status in ["blocked", "failed"] and older_than?(updated_at, now, @debug_retention_seconds) ->
+        {true, "debug_ttl_expired"}
+
+      status in ["blocked", "failed"] ->
+        {false, "debug_ttl"}
+
+      status in ["abandoned"] and older_than?(updated_at, now, @abandoned_retention_seconds) ->
+        {true, "abandoned_ttl_expired"}
+
+      status in ["abandoned"] ->
+        {false, "abandoned_ttl"}
+
+      true ->
+        {false, nil}
+    end
+  end
+
+  defp older_than?(%DateTime{} = timestamp, %DateTime{} = now, seconds) do
+    DateTime.diff(now, timestamp, :second) >= seconds
+  end
+
+  defp older_than?(timestamp, %DateTime{} = now, seconds) when is_binary(timestamp) do
+    case DateTime.from_iso8601(timestamp) do
+      {:ok, datetime, _offset} -> older_than?(datetime, now, seconds)
+      _ -> false
+    end
+  end
+
+  defp older_than?(_timestamp, _now, _seconds), do: false
+
+  defp missing_worktree_output?(output) when is_binary(output) do
+    output =~ "is not a working tree" or output =~ "is not a git repository" or
+      output =~ "No such file"
   end
 
   @spec load_change_artifacts(Path.t(), String.t()) :: {:ok, map()} | {:error, term()}
@@ -206,21 +639,22 @@ defmodule SymphonyElixir.StudioRunner.Executor do
   defp unwrap_artifact({:ok, content}), do: content
   defp unwrap_artifact({:error, _reason}), do: nil
 
-  defp build_context(%WorkItem{} = work_item, source_repo, workspace, artifacts) do
+  defp build_context(%WorkItem{} = work_item, source_repo, workspace_lifecycle, artifacts) do
     %{
       event_id: work_item.event_id,
       run_id: work_item.run_id,
       repo_path: source_repo,
       repo_name: work_item.repo_name || Path.basename(source_repo),
       repo_remote: work_item.repo_remote,
-      workspace_path: workspace,
+      workspace_path: workspace_lifecycle.workspace_path,
       change: work_item.change,
-      branch_name: branch_name(work_item),
+      branch_name: workspace_lifecycle.branch_name,
       artifacts: artifacts,
       validation: work_item.validation || %{},
       git_ref: work_item.git_ref,
-      base_commit_sha: current_commit(workspace),
-      requested_by: work_item.requested_by
+      base_commit_sha: workspace_lifecycle.base_commit_sha,
+      requested_by: work_item.requested_by,
+      workspace_lifecycle: workspace_lifecycle
     }
   end
 
@@ -234,7 +668,7 @@ defmodule SymphonyElixir.StudioRunner.Executor do
     You are Symphony Studio Runner working on an OpenSpec change.
 
     This is an unattended orchestration session. Do not ask a human to do follow-up actions.
-    Work only in the Symphony-managed workspace below. Do not modify the original source repo path.
+    Work only in the Symphony-managed Git worktree below. Do not modify the original source repo path.
 
     Repository:
     - Name: #{context.repo_name}
@@ -247,13 +681,13 @@ defmodule SymphonyElixir.StudioRunner.Executor do
     - Event ID: #{context.event_id}
     - Run ID: #{context.run_id || "unknown"}
     - Change: #{context.change}
-    - Branch to create/use: #{context.branch_name}
+    - Branch to use: #{context.branch_name}
     - Requested by: #{context.requested_by || "unknown"}
     - Validation at dispatch: #{inspect(context.validation)}
 
     Required workflow:
     1. Inspect the OpenSpec change artifacts below and the repository state.
-    2. Create or switch to branch `#{context.branch_name}` from the repo default branch when possible.
+    2. Stay on branch `#{context.branch_name}`. It has already been created from the fetched remote default branch.
     3. Implement the selected OpenSpec change.
     4. Update `openspec/changes/#{context.change}/tasks.md` only for work actually completed.
     5. Run targeted validation/tests and record the evidence.
@@ -316,19 +750,36 @@ defmodule SymphonyElixir.StudioRunner.Executor do
     pr_url = result[:pr_url]
     commit_sha = result[:commit_sha]
     status = result[:status] || terminal_status(pr_url)
+    now = DateTime.utc_now()
 
     %{
       status: status,
       workspacePath: context.workspace_path,
+      workspaceStatus: terminal_workspace_status(status),
+      workspaceCreatedAt: iso8601(context.workspace_lifecycle.created_at),
+      workspaceUpdatedAt: iso8601(now),
+      sourceRepoPath: context.repo_path,
+      baseCommitSha: context.base_commit_sha,
       sessionId: result[:session_id],
       branchName: result[:branch_name] || context.branch_name,
       commitSha: commit_sha,
       prUrl: pr_url,
       error: result[:error]
     }
+    |> Map.merge(
+      cleanup_metadata(
+        %{status: status, prUrl: pr_url, workspacePath: context.workspace_path, updatedAt: now},
+        now
+      )
+    )
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.new()
   end
+
+  defp terminal_workspace_status("completed"), do: "published"
+  defp terminal_workspace_status("blocked"), do: "blocked"
+  defp terminal_workspace_status("failed"), do: "failed"
+  defp terminal_workspace_status(_status), do: "active"
 
   defp terminal_status(pr_url) when is_binary(pr_url) and pr_url != "", do: "completed"
   defp terminal_status(_pr_url), do: "blocked"
@@ -339,7 +790,8 @@ defmodule SymphonyElixir.StudioRunner.Executor do
   end
 
   @spec inspect_workspace_publication(Path.t(), execution_context()) :: {:ok, map()}
-  def inspect_workspace_publication(workspace, context) when is_binary(workspace) and is_map(context) do
+  def inspect_workspace_publication(workspace, context)
+      when is_binary(workspace) and is_map(context) do
     expected_branch = context.branch_name
     actual_branch = current_branch(workspace)
     branch_name = actual_branch || expected_branch
@@ -404,7 +856,15 @@ defmodule SymphonyElixir.StudioRunner.Executor do
   end
 
   defp pull_request_url(workspace, branch_name) when is_binary(branch_name) do
-    case run_workspace_command(workspace, "gh", ["pr", "view", branch_name, "--json", "url", "--jq", ".url"]) do
+    case run_workspace_command(workspace, "gh", [
+           "pr",
+           "view",
+           branch_name,
+           "--json",
+           "url",
+           "--jq",
+           ".url"
+         ]) do
       {:ok, url} -> blank_to_nil(url)
       {:error, _reason} -> nil
     end
@@ -439,7 +899,12 @@ defmodule SymphonyElixir.StudioRunner.Executor do
         true
 
       {:error, _reason} ->
-        case run_workspace_command(workspace, "git", ["ls-remote", "--heads", "origin", branch_name]) do
+        case run_workspace_command(workspace, "git", [
+               "ls-remote",
+               "--heads",
+               "origin",
+               branch_name
+             ]) do
           {:ok, output} -> blank_to_nil(output) != nil
           {:error, _reason} -> false
         end
@@ -447,6 +912,14 @@ defmodule SymphonyElixir.StudioRunner.Executor do
   end
 
   defp branch_pushed?(_workspace, _branch_name), do: false
+
+  defp git_output(repo, args) when is_binary(repo) and is_list(args) do
+    run_git(repo, args)
+  end
+
+  defp run_git(repo, args) when is_binary(repo) and is_list(args) do
+    run_workspace_command(repo, "git", args)
+  end
 
   defp run_workspace_command(workspace, command, args) do
     task =
@@ -500,8 +973,9 @@ defmodule SymphonyElixir.StudioRunner.Executor do
 
   defp short_event_id(event_id) when is_binary(event_id) do
     event_id
+    |> String.replace(~r/^evt[-_]?/, "")
     |> String.replace(~r/[^A-Za-z0-9]/, "")
-    |> String.slice(0, 10)
+    |> String.slice(0, 12)
     |> case do
       "" -> "event"
       value -> value
@@ -523,6 +997,16 @@ defmodule SymphonyElixir.StudioRunner.Executor do
 
   defp hook_context(%WorkItem{} = work_item) do
     %{id: work_item.event_id, identifier: workspace_identifier(work_item)}
+  end
+
+  defp workspace_identifier(%WorkItem{} = work_item) do
+    [
+      "studio-runner",
+      safe_identifier(work_item.repo_name || Path.basename(work_item.repo_path)),
+      safe_identifier(work_item.change),
+      safe_identifier(work_item.run_id || work_item.event_id)
+    ]
+    |> Enum.join("-")
   end
 
   defp ensure_inside_workspace(workspace, path) do
@@ -553,4 +1037,9 @@ defmodule SymphonyElixir.StudioRunner.Executor do
       output
     end
   end
+
+  defp iso8601(%DateTime{} = datetime),
+    do: DateTime.to_iso8601(DateTime.truncate(datetime, :second))
+
+  defp iso8601(_datetime), do: nil
 end

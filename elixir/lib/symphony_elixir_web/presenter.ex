@@ -147,6 +147,15 @@ defmodule SymphonyElixirWeb.Presenter do
       :branchName,
       :commitSha,
       :prUrl,
+      :sourceRepoPath,
+      :baseCommitSha,
+      :workspaceStatus,
+      :workspaceCreatedAt,
+      :workspaceUpdatedAt,
+      :cleanupEligible,
+      :cleanupReason,
+      :cleanupStatus,
+      :cleanupError,
       :error
     ])
     |> Map.merge(%{
