@@ -30,6 +30,7 @@ defmodule SymphonyElixirWeb.Router do
   scope "/", SymphonyElixirWeb do
     get("/api/v1/state", ObservabilityApiController, :state)
     get("/api/v1/studio-runner/health", StudioRunnerController, :health)
+    get("/api/v1/studio-runner/events/stream", StudioRunnerController, :event_stream)
     post("/api/v1/studio-runner/events", StudioRunnerController, :events)
 
     match(:*, "/", ObservabilityApiController, :method_not_allowed)
@@ -37,6 +38,7 @@ defmodule SymphonyElixirWeb.Router do
     post("/api/v1/refresh", ObservabilityApiController, :refresh)
     match(:*, "/api/v1/refresh", ObservabilityApiController, :method_not_allowed)
     match(:*, "/api/v1/studio-runner/health", StudioRunnerController, :method_not_allowed)
+    match(:*, "/api/v1/studio-runner/events/stream", StudioRunnerController, :method_not_allowed)
     match(:*, "/api/v1/studio-runner/events", StudioRunnerController, :method_not_allowed)
     get("/api/v1/:issue_identifier", ObservabilityApiController, :issue)
     match(:*, "/api/v1/:issue_identifier", ObservabilityApiController, :method_not_allowed)

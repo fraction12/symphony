@@ -312,6 +312,104 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
     send(executor_pid, :release_run)
   end
 
+  test "event stream emits current Studio Runner metadata as SSE" do
+    repo_path = Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(repo_path)
+
+    write_workflow_file!(Workflow.workflow_file_path(), studio_runner_signing_secret: "studio-secret")
+
+    orchestrator_name = Module.concat(__MODULE__, :EventStreamSnapshotOrchestrator)
+    start_supervised!({Orchestrator, name: orchestrator_name})
+    parent = self()
+
+    executor = fn work_item ->
+      send(parent, {:executor_started, self(), work_item})
+
+      {:ok,
+       %{
+         status: "completed",
+         workspacePath: "/workspace/run-demo",
+         sessionId: "session-demo",
+         branchName: "studio-runner/introduce-studio-runner",
+         commitSha: "abc1234",
+         prUrl: "https://github.com/fraction12/openspec-studio/pull/1"
+       }}
+    end
+
+    start_test_endpoint(orchestrator: orchestrator_name, studio_runner_executor: executor)
+
+    build_conn()
+    |> put_req_header("content-type", "application/json")
+    |> signed_post("/api/v1/studio-runner/events", studio_payload("evt-stream", repo_path), "studio-secret")
+    |> json_response(202)
+
+    assert_receive {:executor_started, _executor_pid, _work_item}, 500
+
+    assert_eventually(fn ->
+      payload = Orchestrator.snapshot(orchestrator_name, 1_000).studio_runner.events
+      Enum.any?(payload, &(&1.status == "completed"))
+    end)
+
+    conn = get(build_conn(), "/api/v1/studio-runner/events/stream?limit=1", %{})
+
+    assert Plug.Conn.get_resp_header(conn, "content-type") == ["text/event-stream; charset=utf-8"]
+    assert conn.resp_body =~ "event: runner.snapshot"
+    assert conn.resp_body =~ "evt-stream"
+    assert conn.resp_body =~ "session-demo"
+    assert conn.resp_body =~ "abc1234"
+    assert conn.resp_body =~ "https://github.com/fraction12/openspec-studio/pull/1"
+    refute conn.resp_body =~ "proposal.md contents"
+  end
+
+  test "event stream emits live updates after client connects" do
+    repo_path = Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(repo_path)
+
+    write_workflow_file!(Workflow.workflow_file_path(), studio_runner_signing_secret: "studio-secret")
+
+    orchestrator_name = Module.concat(__MODULE__, :EventStreamLiveOrchestrator)
+    start_supervised!({Orchestrator, name: orchestrator_name})
+    parent = self()
+
+    executor = fn work_item ->
+      send(parent, {:executor_started, self(), work_item})
+      {:ok, %{status: "blocked", error: "PR URL was not found"}}
+    end
+
+    start_test_endpoint(orchestrator: orchestrator_name, studio_runner_executor: executor)
+
+    stream_task =
+      Task.async(fn ->
+        get(build_conn(), "/api/v1/studio-runner/events/stream?limit=2", %{})
+      end)
+
+    :timer.sleep(50)
+
+    build_conn()
+    |> put_req_header("content-type", "application/json")
+    |> signed_post("/api/v1/studio-runner/events", studio_payload("evt-live-stream", repo_path), "studio-secret")
+    |> json_response(202)
+
+    assert_receive {:executor_started, _executor_pid, _work_item}, 500
+    conn = Task.await(stream_task, 1_000)
+
+    assert conn.resp_body =~ "event: runner.blocked"
+    assert conn.resp_body =~ "evt-live-stream"
+  end
+
+  defp assert_eventually(fun, attempts \\ 20)
+
+  defp assert_eventually(fun, attempts) when attempts > 0 do
+    if fun.() do
+      :ok
+    else
+      :timer.sleep(25)
+      assert_eventually(fun, attempts - 1)
+    end
+  end
+
+  defp assert_eventually(fun, 0), do: assert(fun.())
+
   defp start_test_endpoint(overrides) do
     endpoint_config =
       :symphony_elixir

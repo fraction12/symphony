@@ -8,7 +8,7 @@ defmodule SymphonyElixirWeb.StudioRunnerController do
   alias Plug.Conn
   alias SymphonyElixir.{Config, Orchestrator}
   alias SymphonyElixir.StudioRunner.{IngressVerifier, Payload, WorkItem}
-  alias SymphonyElixirWeb.Endpoint
+  alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
 
   @spec health(Conn.t(), map()) :: Conn.t()
   def health(conn, _params) do
@@ -90,9 +90,135 @@ defmodule SymphonyElixirWeb.StudioRunnerController do
     end
   end
 
+  @spec event_stream(Conn.t(), map()) :: Conn.t()
+  def event_stream(conn, params) do
+    conn =
+      conn
+      |> put_resp_content_type("text/event-stream")
+      |> put_resp_header("cache-control", "no-cache")
+      |> put_resp_header("connection", "keep-alive")
+      |> send_chunked(200)
+
+    limit = stream_limit(params)
+
+    with {:ok, conn, emitted} <- stream_studio_runner_snapshot(conn, "runner.snapshot") do
+      if stream_limit_reached?(limit, emitted) do
+        conn
+      else
+        stream_updates(conn, limit, emitted)
+      end
+    else
+      {:error, _reason} -> conn
+    end
+  end
+
   @spec method_not_allowed(Conn.t(), map()) :: Conn.t()
   def method_not_allowed(conn, _params) do
     error_response(conn, 405, "method_not_allowed", "Method not allowed")
+  end
+
+  defp stream_updates(conn, limit, emitted) do
+    case ObservabilityPubSub.subscribe_dashboard() do
+      :ok -> stream_update_loop(conn, limit, emitted)
+      {:error, _reason} -> conn
+    end
+  end
+
+  defp stream_update_loop(conn, limit, emitted) do
+    update_message = ObservabilityPubSub.update_message()
+
+    receive do
+      ^update_message ->
+        case stream_studio_runner_snapshot(conn, "runner.update") do
+          {:ok, conn, emitted_now} ->
+            emitted = emitted + emitted_now
+
+            if stream_limit_reached?(limit, emitted) do
+              conn
+            else
+              stream_update_loop(conn, limit, emitted)
+            end
+
+          {:error, _reason} ->
+            conn
+        end
+
+      _other ->
+        stream_update_loop(conn, limit, emitted)
+    after
+      15_000 ->
+        case chunk(conn, ": heartbeat\n\n") do
+          {:ok, conn} -> stream_update_loop(conn, limit, emitted)
+          {:error, _reason} -> conn
+        end
+    end
+  end
+
+  defp stream_studio_runner_snapshot(conn, event_name) do
+    events =
+      case Presenter.state_payload(orchestrator(), 1_000) do
+        %{studio_runner: %{events: events}} when is_list(events) -> events
+        %{"studio_runner" => %{"events" => events}} when is_list(events) -> events
+        _ -> []
+      end
+
+    Enum.reduce_while(events, {:ok, conn, 0}, fn event, {:ok, conn, count} ->
+      case chunk(conn, sse_frame(event_name_for(event, event_name), stream_event_payload(event))) do
+        {:ok, conn} -> {:cont, {:ok, conn, count + 1}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp stream_limit(%{"limit" => value}) when is_binary(value) do
+    case Integer.parse(value) do
+      {limit, ""} when limit > 0 -> limit
+      _ -> nil
+    end
+  end
+
+  defp stream_limit(_params), do: nil
+
+  defp stream_limit_reached?(limit, emitted) when is_integer(limit), do: emitted >= limit
+  defp stream_limit_reached?(_limit, _emitted), do: false
+
+  defp event_name_for(_event, fallback) when fallback != "runner.update", do: fallback
+
+  defp event_name_for(event, _fallback) do
+    case event_status(event) do
+      "running" -> "runner.running"
+      "completed" -> "runner.completed"
+      "blocked" -> "runner.blocked"
+      "failed" -> "runner.failed"
+      "accepted" -> "runner.accepted"
+      _ -> "runner.update"
+    end
+  end
+
+  defp event_status(event) when is_map(event), do: Map.get(event, :status) || Map.get(event, "status")
+  defp event_status(_event), do: nil
+
+  defp stream_event_payload(event) when is_map(event) do
+    %{
+      eventId: Map.get(event, :event_id) || Map.get(event, "event_id"),
+      runId: Map.get(event, :run_id) || Map.get(event, "run_id"),
+      repoChangeKey: Map.get(event, :repo_change_key) || Map.get(event, "repo_change_key"),
+      recordedAt: Map.get(event, :recorded_at) || Map.get(event, "recorded_at"),
+      status: event_status(event),
+      workspacePath: Map.get(event, :workspacePath) || Map.get(event, "workspacePath"),
+      sessionId: Map.get(event, :sessionId) || Map.get(event, "sessionId"),
+      branchName: Map.get(event, :branchName) || Map.get(event, "branchName"),
+      commitSha: Map.get(event, :commitSha) || Map.get(event, "commitSha"),
+      prUrl: Map.get(event, :prUrl) || Map.get(event, "prUrl"),
+      error: Map.get(event, :error) || Map.get(event, "error")
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp sse_frame(event_name, payload) when is_map(payload) do
+    data = Jason.encode!(payload)
+    "event: " <> event_name <> "\n" <> "data: " <> data <> "\n\n"
   end
 
   defp dispatch(%WorkItem{} = work_item) do

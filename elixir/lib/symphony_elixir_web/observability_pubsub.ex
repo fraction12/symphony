@@ -9,8 +9,16 @@ defmodule SymphonyElixirWeb.ObservabilityPubSub do
 
   @spec subscribe() :: :ok | {:error, term()}
   def subscribe do
+    subscribe_dashboard()
+  end
+
+  @spec subscribe_dashboard() :: :ok | {:error, term()}
+  def subscribe_dashboard do
     Phoenix.PubSub.subscribe(@pubsub, @topic)
   end
+
+  @spec update_message() :: :observability_updated
+  def update_message, do: @update_message
 
   @spec broadcast_update() :: :ok
   def broadcast_update do
