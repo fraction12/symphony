@@ -115,8 +115,10 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
 
     assert response.status == "accepted"
 
-    Process.sleep(100)
-    snapshot = Orchestrator.snapshot(orchestrator_name, 1_000)
+    snapshot =
+      eventually_snapshot(orchestrator_name, fn snapshot ->
+        match?(%{events: [%{status: "blocked"}]}, snapshot.studio_runner)
+      end)
 
     assert %{events: [event]} = snapshot.studio_runner
     assert event.status == "blocked"
@@ -125,7 +127,9 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
 
     event_payload = snapshot.studio_runner.events |> hd()
     assert event_payload.status == "blocked"
-    assert event.event_id == "evt-orchestrator-result"
+    assert event_payload.workspacePath == "/tmp/workspace"
+    assert event_payload.sessionId == "session-123"
+    assert event_payload.branchName == "studio-runner/add-runner-work/evt"
   end
 
   test "executor fails before Codex when required OpenSpec artifacts are missing" do
@@ -171,4 +175,19 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
 
     :ok
   end
+
+  defp eventually_snapshot(orchestrator_name, predicate, attempts \\ 20)
+
+  defp eventually_snapshot(orchestrator_name, predicate, attempts) when attempts > 0 do
+    snapshot = Orchestrator.snapshot(orchestrator_name, 1_000)
+
+    if predicate.(snapshot) do
+      snapshot
+    else
+      Process.sleep(10)
+      eventually_snapshot(orchestrator_name, predicate, attempts - 1)
+    end
+  end
+
+  defp eventually_snapshot(orchestrator_name, _predicate, 0), do: Orchestrator.snapshot(orchestrator_name, 1_000)
 end

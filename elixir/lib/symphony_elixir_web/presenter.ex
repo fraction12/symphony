@@ -140,13 +140,22 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp studio_runner_event_payload(entry) do
-    %{
+    entry
+    |> Map.take([
+      :workspacePath,
+      :sessionId,
+      :branchName,
+      :commitSha,
+      :prUrl,
+      :error
+    ])
+    |> Map.merge(%{
       event_id: entry.event_id,
       status: entry.status,
       run_id: entry.run_id,
       repo_change_key: entry.repo_change_key,
       recorded_at: iso8601(entry.recorded_at)
-    }
+    })
   end
 
   defp retry_entry_payload(entry) do

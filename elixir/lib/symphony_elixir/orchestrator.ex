@@ -1485,13 +1485,14 @@ defmodule SymphonyElixir.Orchestrator do
       events:
         state.external_events
         |> Enum.map(fn {event_id, event} ->
-          %{
+          event.payload
+          |> Map.merge(%{
             event_id: event_id,
             status: event.status,
             run_id: event.run_id,
             repo_change_key: event.repo_change_key,
             recorded_at: event.recorded_at
-          }
+          })
         end)
     }
   end
