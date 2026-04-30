@@ -50,7 +50,7 @@ For each accepted Studio Runner work item:
 5. Create a worktree under Symphony's workspace root from the remote-tracking default branch, e.g.:
 
    ```text
-   ~/Symphony Workspaces/runs/<repo-name>/<change-name>/<run-id>
+   ~/code/symphony-workspaces/runs/<repo-name>/<change-name>/<run-id>
    ```
 
    backed by:
