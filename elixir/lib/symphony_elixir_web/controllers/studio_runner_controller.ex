@@ -7,8 +7,33 @@ defmodule SymphonyElixirWeb.StudioRunnerController do
 
   alias Plug.Conn
   alias SymphonyElixir.{Config, Orchestrator}
-  alias SymphonyElixir.StudioRunner.{IngressVerifier, Payload, WorkItem}
+  alias SymphonyElixir.StudioRunner.{Executor, IngressVerifier, Payload, WorkItem}
   alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
+
+  @stream_event_fields [
+    eventId: [:event_id, "event_id"],
+    runId: [:run_id, "run_id"],
+    repoChangeKey: [:repo_change_key, "repo_change_key"],
+    recordedAt: [:recorded_at, "recorded_at"],
+    workspacePath: [:workspacePath, "workspacePath"],
+    sessionId: [:sessionId, "sessionId"],
+    branchName: [:branchName, "branchName"],
+    commitSha: [:commitSha, "commitSha"],
+    prUrl: [:prUrl, "prUrl"],
+    prState: [:prState, "prState"],
+    prMergedAt: [:prMergedAt, "prMergedAt"],
+    prClosedAt: [:prClosedAt, "prClosedAt"],
+    sourceRepoPath: [:sourceRepoPath, "sourceRepoPath"],
+    baseCommitSha: [:baseCommitSha, "baseCommitSha"],
+    workspaceStatus: [:workspaceStatus, "workspaceStatus"],
+    workspaceCreatedAt: [:workspaceCreatedAt, "workspaceCreatedAt"],
+    workspaceUpdatedAt: [:workspaceUpdatedAt, "workspaceUpdatedAt"],
+    cleanupEligible: [:cleanupEligible, "cleanupEligible"],
+    cleanupReason: [:cleanupReason, "cleanupReason"],
+    cleanupStatus: [:cleanupStatus, "cleanupStatus"],
+    cleanupError: [:cleanupError, "cleanupError"],
+    error: [:error, "error"]
+  ]
 
   @spec health(Conn.t(), map()) :: Conn.t()
   def health(conn, _params) do
@@ -101,14 +126,16 @@ defmodule SymphonyElixirWeb.StudioRunnerController do
 
     limit = stream_limit(params)
 
-    with {:ok, conn, emitted} <- stream_studio_runner_snapshot(conn, "runner.snapshot") do
-      if stream_limit_reached?(limit, emitted) do
+    case stream_studio_runner_snapshot(conn, "runner.snapshot") do
+      {:ok, conn, emitted} ->
+        if stream_limit_reached?(limit, emitted) do
+          conn
+        else
+          stream_updates(conn, limit, emitted)
+        end
+
+      {:error, _reason} ->
         conn
-      else
-        stream_updates(conn, limit, emitted)
-      end
-    else
-      {:error, _reason} -> conn
     end
   end
 
@@ -199,30 +226,16 @@ defmodule SymphonyElixirWeb.StudioRunnerController do
   defp event_status(_event), do: nil
 
   defp stream_event_payload(event) when is_map(event) do
-    %{
-      eventId: Map.get(event, :event_id) || Map.get(event, "event_id"),
-      runId: Map.get(event, :run_id) || Map.get(event, "run_id"),
-      repoChangeKey: Map.get(event, :repo_change_key) || Map.get(event, "repo_change_key"),
-      recordedAt: Map.get(event, :recorded_at) || Map.get(event, "recorded_at"),
-      status: event_status(event),
-      workspacePath: Map.get(event, :workspacePath) || Map.get(event, "workspacePath"),
-      sessionId: Map.get(event, :sessionId) || Map.get(event, "sessionId"),
-      branchName: Map.get(event, :branchName) || Map.get(event, "branchName"),
-      commitSha: Map.get(event, :commitSha) || Map.get(event, "commitSha"),
-      prUrl: Map.get(event, :prUrl) || Map.get(event, "prUrl"),
-      sourceRepoPath: Map.get(event, :sourceRepoPath) || Map.get(event, "sourceRepoPath"),
-      baseCommitSha: Map.get(event, :baseCommitSha) || Map.get(event, "baseCommitSha"),
-      workspaceStatus: Map.get(event, :workspaceStatus) || Map.get(event, "workspaceStatus"),
-      workspaceCreatedAt: Map.get(event, :workspaceCreatedAt) || Map.get(event, "workspaceCreatedAt"),
-      workspaceUpdatedAt: Map.get(event, :workspaceUpdatedAt) || Map.get(event, "workspaceUpdatedAt"),
-      cleanupEligible: Map.get(event, :cleanupEligible) || Map.get(event, "cleanupEligible"),
-      cleanupReason: Map.get(event, :cleanupReason) || Map.get(event, "cleanupReason"),
-      cleanupStatus: Map.get(event, :cleanupStatus) || Map.get(event, "cleanupStatus"),
-      cleanupError: Map.get(event, :cleanupError) || Map.get(event, "cleanupError"),
-      error: Map.get(event, :error) || Map.get(event, "error")
-    }
+    @stream_event_fields
+    |> Enum.map(fn {field, keys} -> {field, event_value(event, keys)} end)
+    |> Map.new()
+    |> Map.put(:status, event_status(event))
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.new()
+  end
+
+  defp event_value(event, [atom_key, string_key]) do
+    Map.get(event, atom_key) || Map.get(event, string_key)
   end
 
   defp sse_frame(event_name, payload) when is_map(payload) do
@@ -267,6 +280,6 @@ defmodule SymphonyElixirWeb.StudioRunnerController do
   end
 
   defp executor do
-    Endpoint.config(:studio_runner_executor) || (&SymphonyElixir.StudioRunner.Executor.run/1)
+    Endpoint.config(:studio_runner_executor) || (&Executor.run/1)
   end
 end

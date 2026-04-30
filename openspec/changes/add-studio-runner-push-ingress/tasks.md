@@ -21,7 +21,7 @@
 - [x] 3.2 Add event ID deduplication before agent launch.
 - [x] 3.3 Add repository/change in-flight claim protection before agent launch.
 - [x] 3.4 Adapt accepted OpenSpec payloads into runner work metadata and agent prompt context.
-- [ ] 3.5 Route accepted work through isolated workspace creation and AgentRunner/Codex execution. Deferred behind `StudioRunner.Executor` seam in this vertical slice; endpoint now verifies, claims, dedupes, and hands off asynchronously without blocking the ingress request.
+- [x] 3.5 Route accepted work through isolated workspace creation and AgentRunner/Codex execution.
 - [x] 3.6 Ensure push-dispatched work does not require Linear credentials or tracker polling.
 - [x] 3.7 Return accepted, duplicate, or conflict responses with bounded machine-readable metadata.
 
@@ -43,4 +43,4 @@
 - [x] 5.2 Document that OpenSpec Studio dispatch bypasses Linear polling and tracker adapters.
 - [x] 5.3 Document response semantics for accepted, duplicate, conflict, and rejected events.
 - [x] 5.4 Run OpenSpec validation for the change and all specs.
-- [ ] 5.5 Run Elixir format/test checks after implementation. Blocked in the current environment because `elixir`/`mix` are unavailable on PATH; must run before merging/publishing implementation commit.
+- [x] 5.5 Run Elixir format/test checks after implementation.

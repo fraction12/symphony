@@ -52,9 +52,8 @@ defmodule SymphonyElixir.StudioRunner.Payload do
 
   defp fetch_absolute_repo_path(data) do
     with {:ok, repo_path} <- fetch_required_string(data, "repoPath"),
-         :ok <- require_absolute_path(repo_path),
-         {:ok, expanded_path} <- expand_existing_directory(repo_path) do
-      {:ok, expanded_path}
+         :ok <- require_absolute_path(repo_path) do
+      expand_existing_directory(repo_path)
     end
   end
 

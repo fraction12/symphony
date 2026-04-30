@@ -7,7 +7,12 @@ defmodule SymphonyElixir.StudioRunner.IngressVerifier do
 
   @type verification_result ::
           {:ok, %{event_id: String.t(), timestamp: integer()}}
-          | {:error, :missing_headers | :invalid_timestamp | :stale_timestamp | :unsupported_signature_version | :invalid_signature}
+          | {:error,
+             :missing_headers
+             | :invalid_timestamp
+             | :stale_timestamp
+             | :unsupported_signature_version
+             | :invalid_signature}
 
   @spec verify(Plug.Conn.t(), binary(), String.t(), pos_integer()) :: verification_result()
   def verify(conn, raw_body, signing_secret, replay_window_seconds)

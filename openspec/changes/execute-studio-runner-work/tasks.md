@@ -12,7 +12,7 @@
 - [x] 2.1 Add Studio Runner workspace creation under configured workspace root using Symphony's existing hook/workspace pattern.
 - [x] 2.2 Canonicalize and validate source repo, selected change, and artifact paths.
 - [x] 2.3 Read OpenSpec change artifacts from the Symphony-managed workspace.
-- [ ] 2.4 Add cleanup/removal helpers for Studio Runner workspaces.
+- [x] 2.4 Add cleanup/removal helpers for Studio Runner workspaces.
 
 ## 3. Prompt and Agent Execution
 

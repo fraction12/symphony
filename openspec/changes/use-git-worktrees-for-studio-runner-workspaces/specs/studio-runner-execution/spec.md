@@ -40,7 +40,7 @@ Studio Runner SHALL track enough per-run workspace metadata to support status di
 - **GIVEN** Symphony creates a Studio Runner worktree
 - **WHEN** the run status is recorded
 - **THEN** the status payload SHALL include the event ID, run ID, repository/change identity, workspace path, branch name, and lifecycle status when available
-- **AND** the metadata SHOULD include base commit SHA, produced commit SHA, PR URL, timestamps, and bounded cleanup errors when available
+- **AND** the metadata SHOULD include base commit SHA, produced commit SHA, PR URL, PR state, PR merge timestamp, PR close timestamp, lifecycle timestamps, and bounded cleanup errors when available
 
 #### Scenario: Metadata survives cleanup
 - **GIVEN** a Studio Runner worktree has been removed safely
@@ -58,6 +58,29 @@ Studio Runner SHALL provide PR-aware and TTL-aware cleanup for inactive Studio R
 - **THEN** Symphony SHALL mark the associated worktree cleanup eligible
 - **AND** Symphony MAY remove the worktree using Git-aware removal
 - **AND** Symphony SHALL preserve run metadata after removal
+
+#### Scenario: Closed PR workspace is retained until the cleanup TTL expires
+- **GIVEN** a Studio Runner run produced a PR URL
+- **AND** the PR has been closed
+- **WHEN** cleanup runs
+- **THEN** Symphony SHALL retain the associated worktree until the closed PR retention TTL expires
+- **AND** Symphony SHALL surface that the closed PR retention TTL is still active
+
+#### Scenario: Closed PR workspace becomes cleanup eligible after TTL
+- **GIVEN** a Studio Runner run produced a PR URL
+- **AND** the PR has been closed
+- **AND** the closed PR retention TTL has expired
+- **WHEN** cleanup runs
+- **THEN** Symphony SHALL mark the associated worktree cleanup eligible
+- **AND** Symphony MAY remove the worktree using Git-aware removal
+- **AND** Symphony SHALL preserve run metadata after removal
+
+#### Scenario: Open PR workspace is retained
+- **GIVEN** a Studio Runner run produced a PR URL
+- **AND** the PR is still open
+- **WHEN** cleanup evaluates the workspace
+- **THEN** Symphony SHALL retain the worktree
+- **AND** Symphony SHALL surface that the PR is still open
 
 #### Scenario: Blocked or failed workspace is retained temporarily
 - **GIVEN** a Studio Runner run ended blocked or failed

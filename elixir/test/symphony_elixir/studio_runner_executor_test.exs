@@ -315,6 +315,250 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
     end
   end
 
+  test "publication inspection captures pull request state when gh returns JSON" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "studio-runner-pr-state-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(test_root, "workspace")
+    File.mkdir_p!(workspace)
+    System.cmd("git", ["init", "--quiet"], cd: workspace)
+    System.cmd("git", ["checkout", "-B", "studio-runner/change/event", "--quiet"], cd: workspace)
+    System.cmd("git", ["config", "user.email", "test@example.com"], cd: workspace)
+    System.cmd("git", ["config", "user.name", "Test User"], cd: workspace)
+    File.write!(Path.join(workspace, "CHANGE"), "done")
+    System.cmd("git", ["add", "."], cd: workspace)
+    System.cmd("git", ["commit", "-m", "change"], cd: workspace)
+
+    gh_bin = Path.join(test_root, "bin/gh")
+    File.mkdir_p!(Path.dirname(gh_bin))
+
+    File.write!(gh_bin, """
+    #!/bin/sh
+    echo '{"url":"https://github.com/example/source/pull/42","state":"OPEN","mergedAt":null}'
+    """)
+
+    File.chmod!(gh_bin, 0o755)
+
+    old_path = System.get_env("PATH")
+    System.put_env("PATH", Path.dirname(gh_bin) <> ":" <> (old_path || ""))
+
+    try do
+      assert {:ok, metadata} =
+               Executor.inspect_workspace_publication(workspace, %{
+                 branch_name: "studio-runner/change/event"
+               })
+
+      assert metadata.status == "completed"
+      assert metadata.pr_url == "https://github.com/example/source/pull/42"
+      assert metadata.pr_state == "OPEN"
+      assert metadata.pr_merged_at == nil
+    after
+      if old_path, do: System.put_env("PATH", old_path), else: System.delete_env("PATH")
+      File.rm_rf!(test_root)
+    end
+  end
+
+  test "cleanup metadata waits while a completed run's pull request is still open" do
+    test_root =
+      Path.join(System.tmp_dir!(), "studio-runner-open-pr-#{System.unique_integer([:positive])}")
+
+    workspace = Path.join(test_root, "workspace")
+    File.mkdir_p!(workspace)
+    old_path = install_fake_gh!(test_root, ~s({"url":"https://github.com/example/source/pull/42","state":"OPEN","mergedAt":null,"closedAt":null}))
+
+    try do
+      assert %{
+               cleanupEligible: false,
+               cleanupReason: "pr_open",
+               prState: "OPEN"
+             } =
+               Executor.cleanup_metadata(%{
+                 status: "completed",
+                 prUrl: "https://github.com/example/source/pull/42",
+                 prState: "OPEN",
+                 workspacePath: workspace
+               })
+    after
+      restore_path!(old_path)
+      File.rm_rf!(test_root)
+    end
+  end
+
+  test "cleanup metadata refreshes stale pull request state before evaluating cleanup" do
+    test_root =
+      Path.join(System.tmp_dir!(), "studio-runner-merged-pr-#{System.unique_integer([:positive])}")
+
+    workspace = Path.join(test_root, "workspace")
+    File.mkdir_p!(workspace)
+
+    merged_at = "2026-04-30T15:00:00Z"
+    old_path = install_fake_gh!(test_root, ~s({"url":"https://github.com/example/source/pull/42","state":"MERGED","mergedAt":"#{merged_at}","closedAt":"#{merged_at}"}))
+
+    try do
+      assert %{
+               cleanupEligible: true,
+               cleanupReason: "pr_merged",
+               prState: "MERGED",
+               prMergedAt: ^merged_at
+             } =
+               Executor.cleanup_metadata(%{
+                 status: "completed",
+                 prUrl: "https://github.com/example/source/pull/42",
+                 prState: "OPEN",
+                 workspacePath: workspace
+               })
+    after
+      restore_path!(old_path)
+      File.rm_rf!(test_root)
+    end
+  end
+
+  test "cleanup metadata defers completed pull requests when state cannot be refreshed" do
+    test_root =
+      Path.join(System.tmp_dir!(), "studio-runner-unknown-pr-#{System.unique_integer([:positive])}")
+
+    workspace = Path.join(test_root, "workspace")
+    bin_dir = Path.join(test_root, "bin")
+    File.mkdir_p!(workspace)
+    File.mkdir_p!(bin_dir)
+
+    old_path = System.get_env("PATH")
+    System.put_env("PATH", bin_dir)
+
+    try do
+      assert %{
+               cleanupEligible: false,
+               cleanupReason: "pr_state_unavailable"
+             } =
+               Executor.cleanup_metadata(%{
+                 status: "completed",
+                 prUrl: "https://github.com/example/source/pull/42",
+                 workspacePath: workspace
+               })
+    after
+      restore_path!(old_path)
+      File.rm_rf!(test_root)
+    end
+  end
+
+  test "cleanup metadata retains recently closed pull requests until the retention TTL expires" do
+    test_root =
+      Path.join(System.tmp_dir!(), "studio-runner-closed-pr-#{System.unique_integer([:positive])}")
+
+    workspace = Path.join(test_root, "workspace")
+    File.mkdir_p!(workspace)
+
+    now = ~U[2026-04-30 20:00:00Z]
+    closed_at = "2026-04-29T20:00:00Z"
+    old_path = install_fake_gh!(test_root, ~s({"url":"https://github.com/example/source/pull/42","state":"CLOSED","mergedAt":null,"closedAt":"#{closed_at}"}))
+
+    try do
+      assert %{
+               cleanupEligible: false,
+               cleanupReason: "pr_closed_ttl",
+               prState: "CLOSED",
+               prClosedAt: ^closed_at
+             } =
+               Executor.cleanup_metadata(
+                 %{
+                   status: "completed",
+                   prUrl: "https://github.com/example/source/pull/42",
+                   workspacePath: workspace
+                 },
+                 now
+               )
+    after
+      restore_path!(old_path)
+      File.rm_rf!(test_root)
+    end
+  end
+
+  test "cleanup metadata allows closed pull requests after the retention TTL" do
+    test_root =
+      Path.join(System.tmp_dir!(), "studio-runner-expired-pr-#{System.unique_integer([:positive])}")
+
+    workspace = Path.join(test_root, "workspace")
+    File.mkdir_p!(workspace)
+
+    now = ~U[2026-04-30 20:00:00Z]
+    closed_at = "2026-04-20T20:00:00Z"
+    old_path = install_fake_gh!(test_root, ~s({"url":"https://github.com/example/source/pull/42","state":"CLOSED","mergedAt":null,"closedAt":"#{closed_at}"}))
+
+    try do
+      assert %{
+               cleanupEligible: true,
+               cleanupReason: "pr_closed_ttl_expired",
+               prState: "CLOSED",
+               prClosedAt: ^closed_at
+             } =
+               Executor.cleanup_metadata(
+                 %{
+                   status: "completed",
+                   prUrl: "https://github.com/example/source/pull/42",
+                   workspacePath: workspace
+                 },
+                 now
+               )
+    after
+      restore_path!(old_path)
+      File.rm_rf!(test_root)
+    end
+  end
+
+  test "cleanup metadata retains legacy completed pull requests without refreshable state" do
+    assert %{
+             cleanupEligible: false,
+             cleanupReason: "pr_state_unavailable"
+           } =
+             Executor.cleanup_metadata(%{
+               status: "completed",
+               prUrl: "https://github.com/example/source/pull/42",
+               workspacePath: "/workspace/run-demo"
+             })
+  end
+
+  test "cleanup metadata allows merged pull request workspaces when refreshed state is available" do
+    test_root =
+      Path.join(System.tmp_dir!(), "studio-runner-merged-pr-#{System.unique_integer([:positive])}")
+
+    workspace = Path.join(test_root, "workspace")
+    File.mkdir_p!(workspace)
+
+    merged_at = "2026-04-30T15:00:00Z"
+    old_path = install_fake_gh!(test_root, ~s({"url":"https://github.com/example/source/pull/42","state":"MERGED","mergedAt":"#{merged_at}","closedAt":"#{merged_at}"}))
+
+    try do
+      assert %{
+               cleanupEligible: true,
+               cleanupReason: "pr_merged"
+             } =
+               Executor.cleanup_metadata(%{
+                 status: "completed",
+                 prUrl: "https://github.com/example/source/pull/42",
+                 workspacePath: workspace
+               })
+    after
+      restore_path!(old_path)
+      File.rm_rf!(test_root)
+    end
+  end
+
+  test "cleanup metadata keeps stored merged state for already captured publication metadata" do
+    assert %{
+             cleanupEligible: true,
+             cleanupReason: "pr_merged"
+           } =
+             Executor.cleanup_metadata(%{
+               status: "completed",
+               prUrl: "https://github.com/example/source/pull/42",
+               prState: "MERGED",
+               workspacePath: "/workspace/run-demo"
+             })
+  end
+
   test "publication inspection reports blocked when commit exists without pull request" do
     test_root =
       Path.join(System.tmp_dir!(), "studio-runner-blocked-#{System.unique_integer([:positive])}")
@@ -506,4 +750,23 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
     System.cmd("git", ["push", "-u", "origin", "main"], cd: source_repo)
     System.cmd("git", ["remote", "set-head", "origin", "main"], cd: source_repo)
   end
+
+  defp install_fake_gh!(test_root, output) do
+    gh_bin = Path.join(test_root, "bin/gh")
+    File.mkdir_p!(Path.dirname(gh_bin))
+
+    File.write!(gh_bin, """
+    #!/bin/sh
+    echo '#{output}'
+    """)
+
+    File.chmod!(gh_bin, 0o755)
+
+    old_path = System.get_env("PATH")
+    System.put_env("PATH", Path.dirname(gh_bin) <> ":" <> (old_path || ""))
+    old_path
+  end
+
+  defp restore_path!(nil), do: System.delete_env("PATH")
+  defp restore_path!(old_path), do: System.put_env("PATH", old_path)
 end

@@ -10,8 +10,8 @@ defmodule SymphonyElixir.StudioRunner.Executor do
 
   require Logger
 
-  alias SymphonyElixir.{Config, PathSafety, Workspace}
   alias SymphonyElixir.Codex.AppServer
+  alias SymphonyElixir.{Config, PathSafety, Workspace}
   alias SymphonyElixir.StudioRunner.WorkItem
 
   @required_artifacts ["proposal.md", "tasks.md"]
@@ -19,6 +19,7 @@ defmodule SymphonyElixir.StudioRunner.Executor do
   @git_command_timeout_ms 15_000
   @cleanup_error_max_bytes 1_024
   @debug_retention_seconds 7 * 24 * 60 * 60
+  @closed_pr_retention_seconds 7 * 24 * 60 * 60
   @abandoned_retention_seconds 3 * 24 * 60 * 60
 
   @type execution_context :: %{
@@ -44,14 +45,15 @@ defmodule SymphonyElixir.StudioRunner.Executor do
           optional(:cleanupEligible) => boolean(),
           optional(:cleanupReason) => String.t(),
           optional(:cleanupError) => String.t(),
-          optional(:cleanupStatus) => String.t()
+          optional(:cleanupStatus) => String.t(),
+          optional(:prState) => String.t(),
+          optional(:prMergedAt) => String.t(),
+          optional(:prClosedAt) => String.t()
         }
 
   @spec run(WorkItem.t()) :: {:ok, map()} | {:error, term()}
   def run(%WorkItem{} = work_item) do
-    Logger.info(
-      "Starting Studio Runner execution event_id=#{work_item.event_id} run_id=#{work_item.run_id || "n/a"} repo_path=#{work_item.repo_path} change=#{work_item.change}"
-    )
+    Logger.info("Starting Studio Runner execution event_id=#{work_item.event_id} run_id=#{work_item.run_id || "n/a"} repo_path=#{work_item.repo_path} change=#{work_item.change}")
 
     case execute(work_item) do
       {:ok, context, result} ->
@@ -64,9 +66,7 @@ defmodule SymphonyElixir.StudioRunner.Executor do
         {:ok, metadata}
 
       {:error, reason} ->
-        Logger.error(
-          "Studio Runner execution failed event_id=#{work_item.event_id} run_id=#{work_item.run_id || "n/a"} reason=#{inspect(reason)}"
-        )
+        Logger.error("Studio Runner execution failed event_id=#{work_item.event_id} run_id=#{work_item.run_id || "n/a"} reason=#{inspect(reason)}")
 
         {:error, reason}
     end
@@ -202,23 +202,7 @@ defmodule SymphonyElixir.StudioRunner.Executor do
     with {:ok, canonical_source} <- canonical_source_repo(source_repo),
          :ok <- validate_worktree_cleanup_path(canonical_source, workspace_path),
          :ok <- ensure_registered_worktree(canonical_source, workspace_path) do
-      case run_git(canonical_source, ["worktree", "remove", workspace_path]) do
-        {:ok, _output} ->
-          prune_worktrees(canonical_source)
-          %{workspacePath: workspace_path, cleanupStatus: "cleaned"}
-
-        {:error, {_command, _status, output} = reason} ->
-          metadata = cleanup_error_metadata(workspace_path, {:worktree_remove_failed, reason})
-
-          if missing_worktree_output?(output) do
-            prune_worktrees(canonical_source)
-          end
-
-          metadata
-
-        {:error, reason} ->
-          cleanup_error_metadata(workspace_path, {:worktree_remove_failed, reason})
-      end
+      remove_registered_worktree(canonical_source, workspace_path)
     else
       {:error, reason} -> cleanup_error_metadata(workspace_path, reason)
     end
@@ -231,15 +215,42 @@ defmodule SymphonyElixir.StudioRunner.Executor do
 
     status = Map.get(event_metadata, :status) || Map.get(event_metadata, "status")
     pr_url = Map.get(event_metadata, :prUrl) || Map.get(event_metadata, "prUrl")
+    pr_state = Map.get(event_metadata, :prState) || Map.get(event_metadata, "prState")
+    pr_merged_at = Map.get(event_metadata, :prMergedAt) || Map.get(event_metadata, "prMergedAt")
+    pr_closed_at = Map.get(event_metadata, :prClosedAt) || Map.get(event_metadata, "prClosedAt")
 
     updated_at =
       Map.get(event_metadata, :updatedAt) || Map.get(event_metadata, "updatedAt") || now
 
-    {eligible?, reason} = cleanup_eligibility(status, pr_url, updated_at, now)
+    {pr_metadata, refreshed?} =
+      cleanup_pull_request_metadata(status, workspace_path, pr_url, %{
+        state: pr_state,
+        merged_at: pr_merged_at,
+        closed_at: pr_closed_at
+      })
+
+    pr_state = pr_metadata[:state]
+    pr_merged_at = pr_metadata[:merged_at]
+    pr_closed_at = pr_metadata[:closed_at]
+
+    {eligible?, reason} =
+      cleanup_eligibility(
+        status,
+        pr_url,
+        pr_state,
+        pr_merged_at,
+        pr_closed_at,
+        updated_at,
+        now,
+        refreshed?
+      )
 
     %{
       workspacePath: workspace_path,
       status: status,
+      prState: pr_state,
+      prMergedAt: pr_merged_at,
+      prClosedAt: pr_closed_at,
       cleanupEligible: eligible?,
       cleanupReason: reason
     }
@@ -382,9 +393,8 @@ defmodule SymphonyElixir.StudioRunner.Executor do
     with :ok <- validate_worktree_workspace_path(workspace_path, source_repo),
          {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace_path),
          true <-
-           File.dir?(canonical_workspace) || {:error, {:workspace_missing, canonical_workspace}},
-         :ok <- ensure_inactive_worktree(canonical_workspace) do
-      :ok
+           File.dir?(canonical_workspace) || {:error, {:workspace_missing, canonical_workspace}} do
+      ensure_inactive_worktree(canonical_workspace)
     end
   end
 
@@ -448,9 +458,8 @@ defmodule SymphonyElixir.StudioRunner.Executor do
              {:error, {:workspace_event_mismatch, workspace_path}},
          true <-
            Map.get(marker, "run_id") == work_item.run_id ||
-             {:error, {:workspace_run_mismatch, workspace_path}},
-         :ok <- ensure_worktree_base_available(workspace_path, remote_ref) do
-      :ok
+             {:error, {:workspace_run_mismatch, workspace_path}} do
+      ensure_worktree_base_available(workspace_path, remote_ref)
     end
   end
 
@@ -504,19 +513,26 @@ defmodule SymphonyElixir.StudioRunner.Executor do
   defp ensure_registered_worktree(source_repo, workspace_path) do
     with {:ok, output} <- git_output(source_repo, ["worktree", "list", "--porcelain"]),
          {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace_path) do
-      registered? =
-        output
-        |> String.split("\n", trim: true)
-        |> Enum.filter(&String.starts_with?(&1, "worktree "))
-        |> Enum.map(&String.replace_prefix(&1, "worktree ", ""))
-        |> Enum.any?(fn path ->
-          case PathSafety.canonicalize(path) do
-            {:ok, canonical_path} -> canonical_path == canonical_workspace
-            {:error, _reason} -> false
-          end
-        end)
+      if registered_worktree?(output, canonical_workspace) do
+        :ok
+      else
+        {:error, {:unknown_worktree, workspace_path}}
+      end
+    end
+  end
 
-      if registered?, do: :ok, else: {:error, {:unknown_worktree, workspace_path}}
+  defp registered_worktree?(output, canonical_workspace) do
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.filter(&String.starts_with?(&1, "worktree "))
+    |> Enum.map(&String.replace_prefix(&1, "worktree ", ""))
+    |> Enum.any?(&worktree_path_matches?(&1, canonical_workspace))
+  end
+
+  defp worktree_path_matches?(path, canonical_workspace) do
+    case PathSafety.canonicalize(path) do
+      {:ok, canonical_path} -> canonical_path == canonical_workspace
+      {:error, _reason} -> false
     end
   end
 
@@ -542,30 +558,134 @@ defmodule SymphonyElixir.StudioRunner.Executor do
     }
   end
 
-  defp cleanup_eligibility(status, pr_url, updated_at, now) do
+  defp remove_registered_worktree(canonical_source, workspace_path) do
+    case run_git(canonical_source, ["worktree", "remove", workspace_path]) do
+      {:ok, _output} ->
+        prune_worktrees(canonical_source)
+        %{workspacePath: workspace_path, cleanupStatus: "cleaned"}
+
+      {:error, {_command, _status, output} = reason} ->
+        metadata = cleanup_error_metadata(workspace_path, {:worktree_remove_failed, reason})
+
+        if missing_worktree_output?(output) do
+          prune_worktrees(canonical_source)
+        end
+
+        metadata
+
+      {:error, reason} ->
+        cleanup_error_metadata(workspace_path, {:worktree_remove_failed, reason})
+    end
+  end
+
+  defp cleanup_pull_request_metadata(status, workspace_path, pr_url, stored_metadata) do
+    if status == "completed" and nonblank_string?(pr_url) and is_binary(workspace_path) and
+         File.dir?(workspace_path) do
+      case pull_request_metadata(workspace_path, pr_url) do
+        metadata when map_size(metadata) > 0 ->
+          {Map.merge(stored_metadata, metadata), true}
+
+        _ ->
+          {stored_metadata, false}
+      end
+    else
+      {stored_metadata, false}
+    end
+  end
+
+  defp cleanup_eligibility(
+         "completed",
+         pr_url,
+         pr_state,
+         pr_merged_at,
+         pr_closed_at,
+         updated_at,
+         now,
+         refreshed?
+       ) do
+    completed_cleanup_eligibility(
+      pr_url,
+      pr_state,
+      pr_merged_at,
+      pr_closed_at,
+      updated_at,
+      now,
+      refreshed?
+    )
+  end
+
+  defp cleanup_eligibility(status, _pr_url, _pr_state, _pr_merged_at, _pr_closed_at, _updated_at, _now, _refreshed?)
+       when status in ["running", "accepted"],
+       do: {false, "active"}
+
+  defp cleanup_eligibility(status, _pr_url, _pr_state, _pr_merged_at, _pr_closed_at, updated_at, now, _refreshed?)
+       when status in ["blocked", "failed"] do
+    if older_than?(updated_at, now, @debug_retention_seconds) do
+      {true, "debug_ttl_expired"}
+    else
+      {false, "debug_ttl"}
+    end
+  end
+
+  defp cleanup_eligibility("abandoned", _pr_url, _pr_state, _pr_merged_at, _pr_closed_at, updated_at, now, _refreshed?) do
+    if older_than?(updated_at, now, @abandoned_retention_seconds) do
+      {true, "abandoned_ttl_expired"}
+    else
+      {false, "abandoned_ttl"}
+    end
+  end
+
+  defp cleanup_eligibility(_status, _pr_url, _pr_state, _pr_merged_at, _pr_closed_at, _updated_at, _now, _refreshed?) do
+    {false, nil}
+  end
+
+  defp completed_cleanup_eligibility(
+         pr_url,
+         pr_state,
+         pr_merged_at,
+         pr_closed_at,
+         updated_at,
+         now,
+         refreshed?
+       ) do
     cond do
-      status in ["running", "accepted"] ->
-        {false, "active"}
+      pr_merged?(pr_state, pr_merged_at) ->
+        {true, "pr_merged"}
 
-      status == "completed" and is_binary(pr_url) and pr_url != "" ->
-        {true, "published"}
+      pr_closed?(pr_state) ->
+        closed_pr_cleanup_eligibility(pr_closed_at || updated_at, now)
 
-      status in ["blocked", "failed"] and older_than?(updated_at, now, @debug_retention_seconds) ->
-        {true, "debug_ttl_expired"}
+      pr_open?(pr_state) and refreshed? ->
+        {false, "pr_open"}
 
-      status in ["blocked", "failed"] ->
-        {false, "debug_ttl"}
-
-      status in ["abandoned"] and older_than?(updated_at, now, @abandoned_retention_seconds) ->
-        {true, "abandoned_ttl_expired"}
-
-      status in ["abandoned"] ->
-        {false, "abandoned_ttl"}
+      nonblank_string?(pr_url) ->
+        {false, "pr_state_unavailable"}
 
       true ->
         {false, nil}
     end
   end
+
+  defp closed_pr_cleanup_eligibility(closed_at, now) do
+    if older_than?(closed_at, now, @closed_pr_retention_seconds) do
+      {true, "pr_closed_ttl_expired"}
+    else
+      {false, "pr_closed_ttl"}
+    end
+  end
+
+  defp pr_merged?(state, merged_at) do
+    normalize_pr_state(state) == "MERGED" or nonblank_string?(merged_at)
+  end
+
+  defp pr_closed?(state), do: normalize_pr_state(state) == "CLOSED"
+  defp pr_open?(state), do: normalize_pr_state(state) == "OPEN"
+
+  defp normalize_pr_state(state) when is_binary(state), do: String.upcase(String.trim(state))
+  defp normalize_pr_state(_state), do: nil
+
+  defp nonblank_string?(value) when is_binary(value), do: String.trim(value) != ""
+  defp nonblank_string?(_value), do: false
 
   defp older_than?(%DateTime{} = timestamp, %DateTime{} = now, seconds) do
     DateTime.diff(now, timestamp, :second) >= seconds
@@ -768,6 +888,9 @@ defmodule SymphonyElixir.StudioRunner.Executor do
 
   defp execution_metadata(context, result) when is_map(context) and is_map(result) do
     pr_url = result[:pr_url]
+    pr_state = result[:pr_state]
+    pr_merged_at = result[:pr_merged_at]
+    pr_closed_at = result[:pr_closed_at]
     commit_sha = result[:commit_sha]
     status = result[:status] || terminal_status(pr_url)
     now = DateTime.utc_now()
@@ -784,11 +907,22 @@ defmodule SymphonyElixir.StudioRunner.Executor do
       branchName: result[:branch_name] || context.branch_name,
       commitSha: commit_sha,
       prUrl: pr_url,
+      prState: pr_state,
+      prMergedAt: pr_merged_at,
+      prClosedAt: pr_closed_at,
       error: result[:error]
     }
     |> Map.merge(
       cleanup_metadata(
-        %{status: status, prUrl: pr_url, workspacePath: context.workspace_path, updatedAt: now},
+        %{
+          status: status,
+          prUrl: pr_url,
+          prState: pr_state,
+          prMergedAt: pr_merged_at,
+          prClosedAt: pr_closed_at,
+          workspacePath: context.workspace_path,
+          updatedAt: now
+        },
         now
       )
     )
@@ -818,16 +952,21 @@ defmodule SymphonyElixir.StudioRunner.Executor do
     head_commit = current_commit(workspace)
     commit_sha = published_commit_sha(head_commit, context)
 
-    pr_url =
+    pr_metadata =
       if actual_branch == expected_branch and commit_sha do
-        pull_request_url(workspace, actual_branch)
+        pull_request_metadata(workspace, actual_branch)
+      else
+        %{}
       end
 
     metadata = %{
       branch_name: branch_name,
       commit_sha: commit_sha,
-      pr_url: pr_url,
-      status: terminal_status(pr_url),
+      pr_url: pr_metadata[:url],
+      pr_state: pr_metadata[:state],
+      pr_merged_at: pr_metadata[:merged_at],
+      pr_closed_at: pr_metadata[:closed_at],
+      status: terminal_status(pr_metadata[:url]),
       expected_branch: expected_branch,
       actual_branch: actual_branch,
       head_commit: head_commit
@@ -875,22 +1014,37 @@ defmodule SymphonyElixir.StudioRunner.Executor do
     end
   end
 
-  defp pull_request_url(workspace, branch_name) when is_binary(branch_name) do
+  defp pull_request_metadata(workspace, branch_name) when is_binary(branch_name) do
     case run_workspace_command(workspace, "gh", [
            "pr",
            "view",
            branch_name,
            "--json",
-           "url",
-           "--jq",
-           ".url"
+           "url,state,mergedAt,closedAt"
          ]) do
-      {:ok, url} -> blank_to_nil(url)
-      {:error, _reason} -> nil
+      {:ok, output} -> parse_pull_request_metadata(output)
+      {:error, _reason} -> %{}
     end
   end
 
-  defp pull_request_url(_workspace, _branch_name), do: nil
+  defp pull_request_metadata(_workspace, _branch_name), do: %{}
+
+  defp parse_pull_request_metadata(output) when is_binary(output) do
+    case Jason.decode(output) do
+      {:ok, %{} = payload} ->
+        %{
+          url: blank_to_nil(Map.get(payload, "url")),
+          state: blank_to_nil(Map.get(payload, "state")),
+          merged_at: blank_to_nil(Map.get(payload, "mergedAt")),
+          closed_at: blank_to_nil(Map.get(payload, "closedAt"))
+        }
+        |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+        |> Map.new()
+
+      _ ->
+        %{url: blank_to_nil(output)}
+    end
+  end
 
   defp publication_blocker(%{status: "completed"}, _workspace), do: nil
 
@@ -967,6 +1121,8 @@ defmodule SymphonyElixir.StudioRunner.Executor do
       trimmed -> trimmed
     end
   end
+
+  defp blank_to_nil(_value), do: nil
 
   defp continuation_prompt(turn_number, max_turns) do
     """

@@ -27,7 +27,7 @@
 ## Cleanup
 
 - [x] Implement Git-aware worktree removal using `git worktree remove` and `git worktree prune`.
-- [ ] Add PR-state inspection for merged/closed PR cleanup when `gh` auth/tooling is available.
+- [x] Add PR-state inspection for merged/closed PR cleanup when `gh` auth/tooling is available.
 - [x] Add TTL rules for blocked/failed/abandoned inactive worktrees.
 - [x] Ensure cleanup refuses active, unknown, outside-root, or source-repo paths.
 - [x] Add bounded cleanup errors to status payloads.

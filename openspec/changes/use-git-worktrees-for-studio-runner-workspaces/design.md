@@ -98,7 +98,7 @@ If Git-aware removal fails because the directory is already gone, Symphony shoul
 Completion already requires a PR URL. For cleanup, Symphony can inspect PR state when `gh` is available:
 
 ```bash
-gh pr view <branch> --json url,state,mergedAt,closed
+gh pr view <branch-or-pr-url> --json url,state,mergedAt,closedAt
 ```
 
 If PR state cannot be checked because auth/tooling is missing, cleanup should not delete the workspace automatically. It should mark cleanup as blocked/deferred and surface the reason.
