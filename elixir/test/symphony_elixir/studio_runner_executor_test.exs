@@ -221,6 +221,64 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
     end
   end
 
+  test "publication inspection blocks unchanged workspace at dispatch commit" do
+    test_root =
+      Path.join(System.tmp_dir!(), "studio-runner-unchanged-#{System.unique_integer([:positive])}")
+
+    workspace = Path.join(test_root, "workspace")
+    File.mkdir_p!(workspace)
+    System.cmd("git", ["init", "--quiet"], cd: workspace)
+    System.cmd("git", ["checkout", "-B", "studio-runner/change/event", "--quiet"], cd: workspace)
+    System.cmd("git", ["config", "user.email", "test@example.com"], cd: workspace)
+    System.cmd("git", ["config", "user.name", "Test User"], cd: workspace)
+    File.write!(Path.join(workspace, "CHANGE"), "original")
+    System.cmd("git", ["add", "."], cd: workspace)
+    System.cmd("git", ["commit", "-m", "initial"], cd: workspace)
+    {base_commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: workspace)
+
+    try do
+      assert {:ok, metadata} =
+               Executor.inspect_workspace_publication(workspace, %{
+                 branch_name: "studio-runner/change/event",
+                 base_commit_sha: String.trim(base_commit)
+               })
+
+      assert metadata.status == "blocked"
+      assert metadata.commit_sha == nil
+      assert metadata.error =~ "without a new workspace commit"
+    after
+      File.rm_rf!(test_root)
+    end
+  end
+
+  test "publication inspection blocks work on the wrong branch" do
+    test_root =
+      Path.join(System.tmp_dir!(), "studio-runner-wrong-branch-#{System.unique_integer([:positive])}")
+
+    workspace = Path.join(test_root, "workspace")
+    File.mkdir_p!(workspace)
+    System.cmd("git", ["init", "--quiet"], cd: workspace)
+    System.cmd("git", ["checkout", "-B", "wrong-branch", "--quiet"], cd: workspace)
+    System.cmd("git", ["config", "user.email", "test@example.com"], cd: workspace)
+    System.cmd("git", ["config", "user.name", "Test User"], cd: workspace)
+    File.write!(Path.join(workspace, "CHANGE"), "done")
+    System.cmd("git", ["add", "."], cd: workspace)
+    System.cmd("git", ["commit", "-m", "change"], cd: workspace)
+
+    try do
+      assert {:ok, metadata} =
+               Executor.inspect_workspace_publication(workspace, %{
+                 branch_name: "studio-runner/change/event"
+               })
+
+      assert metadata.status == "blocked"
+      assert metadata.commit_sha =~ ~r/^[0-9a-f]{40}$/
+      assert metadata.error =~ "instead of expected branch"
+    after
+      File.rm_rf!(test_root)
+    end
+  end
+
   test "executor fails before Codex when required OpenSpec artifacts are missing" do
     test_root =
       Path.join(System.tmp_dir!(), "studio-runner-missing-#{System.unique_integer([:positive])}")

@@ -27,7 +27,8 @@ defmodule SymphonyElixir.StudioRunner.Executor do
           branch_name: String.t(),
           artifacts: map(),
           validation: map(),
-          git_ref: String.t() | nil
+          git_ref: String.t() | nil,
+          base_commit_sha: String.t() | nil
         }
 
   @spec run(WorkItem.t()) :: {:ok, map()} | {:error, term()}
@@ -218,6 +219,7 @@ defmodule SymphonyElixir.StudioRunner.Executor do
       artifacts: artifacts,
       validation: work_item.validation || %{},
       git_ref: work_item.git_ref,
+      base_commit_sha: current_commit(workspace),
       requested_by: work_item.requested_by
     }
   end
@@ -338,15 +340,25 @@ defmodule SymphonyElixir.StudioRunner.Executor do
 
   @spec inspect_workspace_publication(Path.t(), execution_context()) :: {:ok, map()}
   def inspect_workspace_publication(workspace, context) when is_binary(workspace) and is_map(context) do
-    branch_name = current_branch(workspace) || context.branch_name
-    commit_sha = current_commit(workspace)
-    pr_url = pull_request_url(workspace, branch_name)
+    expected_branch = context.branch_name
+    actual_branch = current_branch(workspace)
+    branch_name = actual_branch || expected_branch
+    head_commit = current_commit(workspace)
+    commit_sha = published_commit_sha(head_commit, context)
+
+    pr_url =
+      if actual_branch == expected_branch and commit_sha do
+        pull_request_url(workspace, actual_branch)
+      end
 
     metadata = %{
       branch_name: branch_name,
       commit_sha: commit_sha,
       pr_url: pr_url,
-      status: terminal_status(pr_url)
+      status: terminal_status(pr_url),
+      expected_branch: expected_branch,
+      actual_branch: actual_branch,
+      head_commit: head_commit
     }
 
     error = publication_blocker(metadata, workspace)
@@ -359,6 +371,22 @@ defmodule SymphonyElixir.StudioRunner.Executor do
       end
 
     {:ok, metadata}
+  end
+
+  defp published_commit_sha(nil, _context), do: nil
+
+  defp published_commit_sha(head_commit, context) do
+    base_commits =
+      [Map.get(context, :base_commit_sha), Map.get(context, :git_ref)]
+      |> Enum.filter(&is_binary/1)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+
+    if head_commit in base_commits do
+      nil
+    else
+      head_commit
+    end
   end
 
   defp current_branch(workspace) do
@@ -386,8 +414,13 @@ defmodule SymphonyElixir.StudioRunner.Executor do
 
   defp publication_blocker(%{status: "completed"}, _workspace), do: nil
 
+  defp publication_blocker(%{actual_branch: actual, expected_branch: expected}, _workspace)
+       when is_binary(actual) and is_binary(expected) and actual != expected do
+    "Studio Runner finished on branch `#{actual}` instead of expected branch `#{expected}`."
+  end
+
   defp publication_blocker(%{commit_sha: nil}, _workspace),
-    do: "Studio Runner finished without a detectable workspace commit."
+    do: "Studio Runner finished without a new workspace commit."
 
   defp publication_blocker(%{branch_name: nil}, _workspace),
     do: "Studio Runner finished without a detectable branch."
