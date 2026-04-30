@@ -16,6 +16,7 @@ defmodule SymphonyElixir.StudioRunner.Executor do
 
   @required_artifacts ["proposal.md", "tasks.md"]
   @max_artifact_bytes 64_000
+  @git_command_timeout_ms 15_000
 
   @type execution_context :: %{
           event_id: String.t(),
@@ -61,8 +62,9 @@ defmodule SymphonyElixir.StudioRunner.Executor do
          context <- build_context(work_item, source_repo, workspace, artifacts),
          prompt <- build_prompt(context) do
       try do
-        with {:ok, codex_result} <- run_codex(workspace, prompt, work_item, opts) do
-          {:ok, context, codex_result}
+        with {:ok, codex_result} <- run_codex(workspace, prompt, work_item, opts),
+             {:ok, publish_metadata} <- inspect_published_work(workspace, context, opts) do
+          {:ok, context, Map.merge(codex_result, publish_metadata)}
         end
       after
         Workspace.run_after_run_hook(workspace, hook_context(work_item), nil)
@@ -309,16 +311,18 @@ defmodule SymphonyElixir.StudioRunner.Executor do
   end
 
   defp execution_metadata(context, result) when is_map(context) and is_map(result) do
-    pr_url = result[:pr_url] || extract_pr_url(result)
-    commit_sha = result[:commit_sha] || extract_commit_sha(result)
+    pr_url = result[:pr_url]
+    commit_sha = result[:commit_sha]
+    status = result[:status] || terminal_status(pr_url)
 
     %{
-      status: terminal_status(pr_url),
+      status: status,
       workspacePath: context.workspace_path,
       sessionId: result[:session_id],
-      branchName: context.branch_name,
+      branchName: result[:branch_name] || context.branch_name,
       commitSha: commit_sha,
-      prUrl: pr_url
+      prUrl: pr_url,
+      error: result[:error]
     }
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.new()
@@ -327,23 +331,114 @@ defmodule SymphonyElixir.StudioRunner.Executor do
   defp terminal_status(pr_url) when is_binary(pr_url) and pr_url != "", do: "completed"
   defp terminal_status(_pr_url), do: "blocked"
 
-  defp extract_pr_url(result) when is_map(result) do
-    result
-    |> inspect(limit: :infinity, printable_limit: :infinity)
-    |> then(fn text -> Regex.run(~r'https://[^\s)\]}>]+/pull/\d+', text) end)
-    |> case do
-      [url | _] -> url
-      _ -> nil
+  defp inspect_published_work(workspace, context, opts) do
+    inspector = Keyword.get(opts, :publish_inspector, &inspect_workspace_publication/2)
+    inspector.(workspace, context)
+  end
+
+  @spec inspect_workspace_publication(Path.t(), execution_context()) :: {:ok, map()}
+  def inspect_workspace_publication(workspace, context) when is_binary(workspace) and is_map(context) do
+    branch_name = current_branch(workspace) || context.branch_name
+    commit_sha = current_commit(workspace)
+    pr_url = pull_request_url(workspace, branch_name)
+
+    metadata = %{
+      branch_name: branch_name,
+      commit_sha: commit_sha,
+      pr_url: pr_url,
+      status: terminal_status(pr_url)
+    }
+
+    error = publication_blocker(metadata, workspace)
+
+    metadata =
+      if error do
+        Map.put(metadata, :error, error)
+      else
+        metadata
+      end
+
+    {:ok, metadata}
+  end
+
+  defp current_branch(workspace) do
+    case run_workspace_command(workspace, "git", ["branch", "--show-current"]) do
+      {:ok, branch} -> blank_to_nil(branch)
+      {:error, _reason} -> nil
     end
   end
 
-  defp extract_commit_sha(result) when is_map(result) do
-    result
-    |> inspect(limit: :infinity, printable_limit: :infinity)
-    |> then(fn text -> Regex.run(~r'\b[0-9a-f]{40}\b|\b[0-9a-f]{7,12}\b', text) end)
+  defp current_commit(workspace) do
+    case run_workspace_command(workspace, "git", ["rev-parse", "HEAD"]) do
+      {:ok, sha} -> blank_to_nil(sha)
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp pull_request_url(workspace, branch_name) when is_binary(branch_name) do
+    case run_workspace_command(workspace, "gh", ["pr", "view", branch_name, "--json", "url", "--jq", ".url"]) do
+      {:ok, url} -> blank_to_nil(url)
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp pull_request_url(_workspace, _branch_name), do: nil
+
+  defp publication_blocker(%{status: "completed"}, _workspace), do: nil
+
+  defp publication_blocker(%{commit_sha: nil}, _workspace),
+    do: "Studio Runner finished without a detectable workspace commit."
+
+  defp publication_blocker(%{branch_name: nil}, _workspace),
+    do: "Studio Runner finished without a detectable branch."
+
+  defp publication_blocker(%{branch_name: branch_name}, workspace) do
+    if branch_pushed?(workspace, branch_name) do
+      "Studio Runner created/pushed branch `#{branch_name}` but no pull request URL was available."
+    else
+      "Studio Runner created local workspace changes but no pushed branch or pull request was available."
+    end
+  end
+
+  defp branch_pushed?(workspace, branch_name) when is_binary(branch_name) do
+    case run_workspace_command(workspace, "git", ["rev-parse", "--verify", "@{u}"]) do
+      {:ok, _upstream} ->
+        true
+
+      {:error, _reason} ->
+        case run_workspace_command(workspace, "git", ["ls-remote", "--heads", "origin", branch_name]) do
+          {:ok, output} -> blank_to_nil(output) != nil
+          {:error, _reason} -> false
+        end
+    end
+  end
+
+  defp branch_pushed?(_workspace, _branch_name), do: false
+
+  defp run_workspace_command(workspace, command, args) do
+    task =
+      Task.async(fn ->
+        try do
+          System.cmd(command, args, cd: workspace, stderr_to_stdout: true)
+        rescue
+          error in ErlangError -> {:__command_error__, error.original}
+        end
+      end)
+
+    case Task.yield(task, @git_command_timeout_ms) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {output, 0}} -> {:ok, String.trim(output)}
+      {:ok, {:__command_error__, reason}} -> {:error, {command, reason}}
+      {:ok, {output, status}} -> {:error, {command, status, bounded_output(output)}}
+      nil -> {:error, {command, :timeout}}
+    end
+  end
+
+  defp blank_to_nil(value) when is_binary(value) do
+    value
+    |> String.trim()
     |> case do
-      [sha | _] -> sha
-      _ -> nil
+      "" -> nil
+      trimmed -> trimmed
     end
   end
 

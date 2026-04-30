@@ -62,6 +62,15 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
                  send(parent, {:codex_invoked, workspace, prompt, runner_work_item})
                  File.write!(Path.join(workspace, "WORKSPACE_ONLY"), "changed")
                  {:ok, %{session_id: "session-test"}}
+               end,
+               publish_inspector: fn _workspace, _context ->
+                 {:ok,
+                  %{
+                    status: "completed",
+                    branch_name: "studio-runner/add-runner-work/evtexecute",
+                    commit_sha: "0123456789abcdef0123456789abcdef01234567",
+                    pr_url: "https://github.com/example/source/pull/123"
+                  }}
                end
              )
 
@@ -73,6 +82,8 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
 
     assert String.starts_with?(context.workspace_path, canonical_workspace_root <> "/")
     assert result.session_id == "session-test"
+    assert result.status == "completed"
+    assert result.pr_url == "https://github.com/example/source/pull/123"
 
     assert_receive {:codex_invoked, workspace, prompt, ^work_item}, 500
     assert workspace == context.workspace_path
@@ -130,6 +141,84 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
     assert event_payload.workspacePath == "/tmp/workspace"
     assert event_payload.sessionId == "session-123"
     assert event_payload.branchName == "studio-runner/add-runner-work/evt"
+  end
+
+  test "publication inspection reports completed only when a pull request exists" do
+    test_root =
+      Path.join(System.tmp_dir!(), "studio-runner-publication-#{System.unique_integer([:positive])}")
+
+    workspace = Path.join(test_root, "workspace")
+    File.mkdir_p!(workspace)
+    System.cmd("git", ["init", "--quiet"], cd: workspace)
+    System.cmd("git", ["checkout", "-B", "studio-runner/change/event", "--quiet"], cd: workspace)
+    System.cmd("git", ["config", "user.email", "test@example.com"], cd: workspace)
+    System.cmd("git", ["config", "user.name", "Test User"], cd: workspace)
+    File.write!(Path.join(workspace, "CHANGE"), "done")
+    System.cmd("git", ["add", "."], cd: workspace)
+    System.cmd("git", ["commit", "-m", "change"], cd: workspace)
+
+    gh_bin = Path.join(test_root, "bin/gh")
+    File.mkdir_p!(Path.dirname(gh_bin))
+
+    File.write!(gh_bin, """
+    #!/bin/sh
+    echo https://github.com/example/source/pull/42
+    """)
+
+    File.chmod!(gh_bin, 0o755)
+
+    old_path = System.get_env("PATH")
+    System.put_env("PATH", Path.dirname(gh_bin) <> ":" <> (old_path || ""))
+
+    try do
+      assert {:ok, metadata} =
+               Executor.inspect_workspace_publication(workspace, %{
+                 branch_name: "studio-runner/change/event"
+               })
+
+      assert metadata.status == "completed"
+      assert metadata.branch_name == "studio-runner/change/event"
+      assert metadata.commit_sha =~ ~r/^[0-9a-f]{40}$/
+      assert metadata.pr_url == "https://github.com/example/source/pull/42"
+      refute Map.has_key?(metadata, :error)
+    after
+      if old_path, do: System.put_env("PATH", old_path), else: System.delete_env("PATH")
+      File.rm_rf!(test_root)
+    end
+  end
+
+  test "publication inspection reports blocked when commit exists without pull request" do
+    test_root =
+      Path.join(System.tmp_dir!(), "studio-runner-blocked-#{System.unique_integer([:positive])}")
+
+    workspace = Path.join(test_root, "workspace")
+    File.mkdir_p!(workspace)
+    System.cmd("git", ["init", "--quiet"], cd: workspace)
+    System.cmd("git", ["checkout", "-B", "studio-runner/change/event", "--quiet"], cd: workspace)
+    System.cmd("git", ["config", "user.email", "test@example.com"], cd: workspace)
+    System.cmd("git", ["config", "user.name", "Test User"], cd: workspace)
+    File.write!(Path.join(workspace, "CHANGE"), "done")
+    System.cmd("git", ["add", "."], cd: workspace)
+    System.cmd("git", ["commit", "-m", "change"], cd: workspace)
+
+    old_path = System.get_env("PATH")
+    System.put_env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+
+    try do
+      assert {:ok, metadata} =
+               Executor.inspect_workspace_publication(workspace, %{
+                 branch_name: "studio-runner/change/event"
+               })
+
+      assert metadata.status == "blocked"
+      assert metadata.branch_name == "studio-runner/change/event"
+      assert metadata.commit_sha =~ ~r/^[0-9a-f]{40}$/
+      assert metadata.pr_url == nil
+      assert metadata.error =~ "no pushed branch or pull request"
+    after
+      if old_path, do: System.put_env("PATH", old_path), else: System.delete_env("PATH")
+      File.rm_rf!(test_root)
+    end
   end
 
   test "executor fails before Codex when required OpenSpec artifacts are missing" do

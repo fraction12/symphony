@@ -21,7 +21,7 @@
 - [x] 3.3 Wire `StudioRunner.Executor.run/1` into Symphony's AgentRunner/Codex app-server execution flow.
 - [x] 3.4 Ensure Codex cwd is the Symphony workspace, never the original repo path.
 - [x] 3.5 Capture bounded Codex session/run metadata for observability.
-- [ ] 3.6 Capture branch name, commit SHA, and PR URL when the agent publishes work.
+- [x] 3.6 Capture branch name, commit SHA, and PR URL when the agent publishes work.
 - [x] 3.7 Treat completed as PR-created; treat missing auth/tooling for push/PR as blocked rather than completed.
 
 ## 4. Status and Observability
