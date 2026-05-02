@@ -36,7 +36,8 @@ defmodule SymphonyElixir.StudioRunner.Executor do
           git_ref: String.t() | nil,
           base_commit_sha: String.t() | nil,
           requested_by: String.t() | nil,
-          workspace_lifecycle: map()
+          workspace_lifecycle: map(),
+          work_item: WorkItem.t()
         }
 
   @type cleanup_metadata :: %{
@@ -793,6 +794,7 @@ defmodule SymphonyElixir.StudioRunner.Executor do
       git_ref: work_item.git_ref,
       base_commit_sha: workspace_lifecycle.base_commit_sha,
       requested_by: work_item.requested_by,
+      work_item: work_item,
       workspace_lifecycle: workspace_lifecycle
     }
   end
@@ -852,7 +854,7 @@ defmodule SymphonyElixir.StudioRunner.Executor do
 
   defp run_codex(workspace, prompt, %WorkItem{} = work_item, opts) do
     codex_runner = Keyword.get(opts, :codex_runner, &default_codex_runner/4)
-    codex_runner.(workspace, prompt, work_item, opts)
+    codex_runner.(workspace, prompt, work_item, Keyword.merge(opts, runner_turn_options(work_item)))
   end
 
   defp default_codex_runner(workspace, prompt, work_item, opts) do
@@ -871,7 +873,7 @@ defmodule SymphonyElixir.StudioRunner.Executor do
     turn_prompt =
       if turn_number == 1, do: prompt, else: continuation_prompt(turn_number, max_turns)
 
-    case AppServer.run_turn(session, turn_prompt, issue_like_context(work_item), []) do
+    case AppServer.run_turn(session, turn_prompt, issue_like_context(work_item), runner_turn_options(work_item)) do
       {:ok, result} ->
         if turn_number < max_turns do
           # Studio Runner has no tracker state to poll yet. One successful turn is the
@@ -885,6 +887,16 @@ defmodule SymphonyElixir.StudioRunner.Executor do
         {:error, reason}
     end
   end
+
+  defp runner_turn_options(%WorkItem{} = work_item) do
+    []
+    |> maybe_put_runner_turn_option(:model, work_item.runner_model)
+    |> maybe_put_runner_turn_option(:effort, work_item.runner_effort)
+  end
+
+  defp maybe_put_runner_turn_option(opts, _key, nil), do: opts
+  defp maybe_put_runner_turn_option(opts, _key, ""), do: opts
+  defp maybe_put_runner_turn_option(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp execution_metadata(context, result) when is_map(context) and is_map(result) do
     pr_url = result[:pr_url]

@@ -24,6 +24,8 @@ defmodule SymphonyElixir.StudioRunner.Payload do
          git_ref: optional_string(data, "gitRef"),
          change: change,
          requested_by: optional_string(data, "requestedBy"),
+         runner_model: normalize_execution_model(data),
+         runner_effort: normalize_execution_effort(data),
          artifact_paths: optional_string_list(data, "artifactPaths"),
          validation: normalize_validation(Map.get(data, "validation")),
          metadata: normalize_metadata(payload, data)
@@ -86,6 +88,22 @@ defmodule SymphonyElixir.StudioRunner.Payload do
     end
   end
 
+  defp normalize_execution_model(data) when is_map(data) do
+    data
+    |> execution_metadata()
+    |> optional_string("model")
+  end
+
+  defp normalize_execution_effort(data) when is_map(data) do
+    case data |> execution_metadata() |> optional_string("effort") do
+      effort when effort in ["low", "medium", "high"] -> effort
+      _ -> nil
+    end
+  end
+
+  defp execution_metadata(%{"execution" => execution}) when is_map(execution), do: execution
+  defp execution_metadata(_data), do: %{}
+
   defp optional_string_list(map, key) when is_map(map) and is_binary(key) do
     case Map.get(map, key) do
       values when is_list(values) ->
@@ -120,6 +138,8 @@ defmodule SymphonyElixir.StudioRunner.Payload do
     %{}
     |> maybe_put(:payload_id, optional_string(payload, "id"))
     |> maybe_put(:runner, optional_string(data, "runner"))
+    |> maybe_put(:runner_model, normalize_execution_model(data))
+    |> maybe_put(:runner_effort, normalize_execution_effort(data))
   end
 
   defp maybe_put(map, _key, nil), do: map

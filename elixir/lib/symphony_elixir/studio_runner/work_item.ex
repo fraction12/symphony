@@ -15,6 +15,8 @@ defmodule SymphonyElixir.StudioRunner.WorkItem do
     :git_ref,
     :change,
     :requested_by,
+    :runner_model,
+    :runner_effort,
     artifact_paths: [],
     validation: %{},
     metadata: %{}
@@ -32,6 +34,8 @@ defmodule SymphonyElixir.StudioRunner.WorkItem do
           git_ref: String.t() | nil,
           change: String.t(),
           requested_by: String.t() | nil,
+          runner_model: String.t() | nil,
+          runner_effort: String.t() | nil,
           artifact_paths: [String.t()],
           validation: map(),
           metadata: map()
@@ -50,7 +54,9 @@ defmodule SymphonyElixir.StudioRunner.WorkItem do
       runId: work_item.run_id,
       repoPath: work_item.repo_path,
       repoName: work_item.repo_name,
-      change: work_item.change
+      change: work_item.change,
+      runnerModel: work_item.runner_model,
+      runnerEffort: work_item.runner_effort
     }
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.new()

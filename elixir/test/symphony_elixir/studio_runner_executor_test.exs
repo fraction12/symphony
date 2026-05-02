@@ -61,13 +61,15 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
       change: "add-runner-work",
       artifact_paths: ["openspec/changes/add-runner-work/proposal.md"],
       validation: %{"state" => "passed"},
-      requested_by: "test"
+      requested_by: "test",
+      runner_model: "gpt-custom",
+      runner_effort: "high"
     }
 
     assert {:ok, context, result} =
              Executor.execute(work_item,
-               codex_runner: fn workspace, prompt, runner_work_item, _opts ->
-                 send(parent, {:codex_invoked, workspace, prompt, runner_work_item})
+               codex_runner: fn workspace, prompt, runner_work_item, opts ->
+                 send(parent, {:codex_invoked, workspace, prompt, runner_work_item, opts})
                  File.write!(Path.join(workspace, "WORKSPACE_ONLY"), "changed")
                  {:ok, %{session_id: "session-test"}}
                end,
@@ -110,7 +112,9 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
     assert result.pr_url == "https://github.com/example/source/pull/123"
     assert context.base_commit_sha =~ ~r/^[0-9a-f]{40}$/
 
-    assert_receive {:codex_invoked, workspace, prompt, ^work_item}, 500
+    assert_receive {:codex_invoked, workspace, prompt, ^work_item, opts}, 500
+    assert opts[:model] == "gpt-custom"
+    assert opts[:effort] == "high"
     assert workspace == context.workspace_path
     assert prompt =~ "OpenSpec change"
     assert prompt =~ "add-runner-work"
@@ -266,6 +270,49 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
     assert event_payload.workspacePath == "/tmp/workspace"
     assert event_payload.sessionId == "session-123"
     assert event_payload.branchName == "studio-runner/add-runner-work/evt"
+  end
+
+  test "orchestrator status echoes requested runner execution defaults" do
+    work_item = %WorkItem{
+      event_id: "evt-runner-defaults",
+      run_id: nil,
+      event_type: "build.requested",
+      repo_path: "/tmp/source",
+      repo_name: "source",
+      change: "add-runner-work",
+      runner_model: "gpt-custom",
+      runner_effort: "high"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :StudioRunnerDefaultsOrchestrator)
+    start_supervised!({Orchestrator, name: orchestrator_name})
+
+    executor = fn _work_item ->
+      {:ok,
+       %{
+         status: "completed",
+         workspacePath: "/tmp/workspace",
+         sessionId: "session-123",
+         branchName: "studio-runner/add-runner-work/defaults",
+         runnerModel: "gpt-custom",
+         runnerEffort: "high"
+       }}
+    end
+
+    assert {:ok, response} =
+             Orchestrator.dispatch_external_work(orchestrator_name, work_item, executor: executor)
+
+    assert response.runnerModel == "gpt-custom"
+    assert response.runnerEffort == "high"
+
+    snapshot =
+      eventually_snapshot(orchestrator_name, fn snapshot ->
+        match?(%{events: [%{status: "completed"}]}, snapshot.studio_runner)
+      end)
+
+    assert %{events: [event_payload]} = snapshot.studio_runner
+    assert event_payload.runnerModel == "gpt-custom"
+    assert event_payload.runnerEffort == "high"
   end
 
   test "publication inspection reports completed only when a pull request exists" do

@@ -92,6 +92,44 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
     send(executor_pid, :release_run)
   end
 
+  test "valid signed build request preserves runner execution defaults" do
+    repo_path = Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(repo_path)
+
+    write_workflow_file!(Workflow.workflow_file_path(), studio_runner_signing_secret: "studio-secret")
+
+    orchestrator_name = Module.concat(__MODULE__, :ExecutionDefaultsOrchestrator)
+    start_supervised!({Orchestrator, name: orchestrator_name})
+    parent = self()
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      studio_runner_executor: fn work_item -> send(parent, {:executor_started, work_item}) end
+    )
+
+    payload =
+      "evt-execution-defaults"
+      |> studio_payload(repo_path)
+      |> put_in(["data", "execution"], %{"model" => "gpt-custom", "effort" => "high"})
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> signed_post("/api/v1/studio-runner/events", payload, "studio-secret")
+
+    response = json_response(conn, 202)
+
+    assert response["status"] == "accepted"
+    assert response["runnerModel"] == "gpt-custom"
+    assert response["runnerEffort"] == "high"
+
+    assert_receive {:executor_started, work_item}, 500
+    assert work_item.runner_model == "gpt-custom"
+    assert work_item.runner_effort == "high"
+    assert work_item.metadata.runner_model == "gpt-custom"
+    assert work_item.metadata.runner_effort == "high"
+  end
+
   test "invalid signature is rejected before dispatch" do
     write_workflow_file!(Workflow.workflow_file_path(), studio_runner_signing_secret: "studio-secret")
 
