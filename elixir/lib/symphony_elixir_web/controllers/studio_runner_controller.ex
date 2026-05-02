@@ -185,7 +185,6 @@ defmodule SymphonyElixirWeb.StudioRunnerController do
     events =
       case Presenter.state_payload(orchestrator(), 1_000) do
         %{studio_runner: %{events: events}} when is_list(events) -> events
-        %{"studio_runner" => %{"events" => events}} when is_list(events) -> events
         _ -> []
       end
 

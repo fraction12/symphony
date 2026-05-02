@@ -5,8 +5,28 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
   import Plug.Conn, only: [put_req_header: 3]
 
   alias SymphonyElixir.Orchestrator
+  alias SymphonyElixir.StudioRunner.Payload
+  alias SymphonyElixirWeb.RawBodyReader
 
   @endpoint SymphonyElixirWeb.Endpoint
+
+  defmodule DispatchReplyServer do
+    use GenServer
+
+    def start_link(opts) do
+      GenServer.start_link(__MODULE__, Keyword.fetch!(opts, :reply), name: Keyword.fetch!(opts, :name))
+    end
+
+    @impl true
+    def init(reply), do: {:ok, reply}
+
+    @impl true
+    def handle_call({:dispatch_external_work, _work_item, _opts}, _from, reply), do: {:reply, reply, reply}
+
+    def handle_call({:set_reply, next_reply}, _from, _reply), do: {:reply, :ok, next_reply}
+
+    def handle_call(:snapshot, _from, reply), do: {:reply, reply, reply}
+  end
 
   setup do
     endpoint_config = Application.get_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, [])
@@ -19,7 +39,10 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
   end
 
   test "health endpoint reports configured signed ingress" do
-    write_workflow_file!(Workflow.workflow_file_path(), studio_runner_signing_secret: "studio-secret")
+    write_workflow_file!(Workflow.workflow_file_path(),
+      studio_runner_signing_secret: "studio-secret"
+    )
+
     start_test_endpoint([])
 
     assert json_response(get(build_conn(), "/api/v1/studio-runner/health"), 200) == %{
@@ -47,7 +70,9 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
   end
 
   test "valid signed build request is accepted without Linear credentials" do
-    repo_path = Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+    repo_path =
+      Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(repo_path)
 
     write_workflow_file!(Workflow.workflow_file_path(),
@@ -93,10 +118,14 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
   end
 
   test "valid signed build request preserves runner execution defaults" do
-    repo_path = Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+    repo_path =
+      Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(repo_path)
 
-    write_workflow_file!(Workflow.workflow_file_path(), studio_runner_signing_secret: "studio-secret")
+    write_workflow_file!(Workflow.workflow_file_path(),
+      studio_runner_signing_secret: "studio-secret"
+    )
 
     orchestrator_name = Module.concat(__MODULE__, :ExecutionDefaultsOrchestrator)
     start_supervised!({Orchestrator, name: orchestrator_name})
@@ -130,8 +159,374 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
     assert work_item.metadata.runner_effort == "high"
   end
 
-  test "invalid signature is rejected before dispatch" do
+  test "payload normalization rejects non-map payloads" do
+    assert Payload.normalize([], "evt-invalid") == {:error, :invalid_payload}
+  end
+
+  test "payload normalization rejects missing data maps" do
+    assert Payload.normalize(%{"type" => "build.requested"}, "evt-missing-data") ==
+             {:error, {:missing_field, "data"}}
+  end
+
+  test "payload normalization ignores invalid optional execution and validation metadata" do
+    repo_path =
+      Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(repo_path)
+
+    payload =
+      "evt-optional-invalid"
+      |> studio_payload(repo_path)
+      |> put_in(["data", "execution"], %{"model" => "  ", "effort" => "extreme"})
+      |> put_in(["data", "artifactPaths"], "not-a-list")
+      |> put_in(["data", "validation"], "not-a-map")
+
+    assert {:ok, work_item} = Payload.normalize(payload, "evt-optional-invalid")
+    assert work_item.runner_model == nil
+    assert work_item.runner_effort == nil
+    assert work_item.artifact_paths == []
+    assert work_item.validation == %{}
+    refute Map.has_key?(work_item.metadata, :runner_model)
+    refute Map.has_key?(work_item.metadata, :runner_effort)
+  end
+
+  test "raw body reader preserves partial body chunks" do
+    conn = Plug.Test.conn("POST", "/api/v1/studio-runner/events", "chunked-body")
+
+    assert {:more, "chunk", conn} = RawBodyReader.read_body(conn, length: 5)
+    assert conn.assigns.raw_body == ["chunk"]
+
+    assert {:ok, "ed-body", conn} = RawBodyReader.read_body(conn, length: 100)
+    assert conn.assigns.raw_body == ["ed-body", "chunk"]
+  end
+
+  test "events endpoint rejects requests when signing secret is missing" do
+    write_workflow_file!(Workflow.workflow_file_path(), studio_runner_signing_secret: nil)
+
+    orchestrator_name = Module.concat(__MODULE__, :MissingSecretOrchestrator)
+    start_supervised!({Orchestrator, name: orchestrator_name})
+    parent = self()
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      studio_runner_executor: fn work_item -> send(parent, {:unexpected_dispatch, work_item}) end
+    )
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> signed_post(
+        "/api/v1/studio-runner/events",
+        studio_payload("evt-missing-secret"),
+        "studio-secret"
+      )
+
+    assert json_response(conn, 503) == %{
+             "error" => %{
+               "code" => "signing_secret_missing",
+               "message" => "Studio Runner signing secret is not configured"
+             }
+           }
+
+    refute_receive {:unexpected_dispatch, _work_item}, 100
+  end
+
+  test "events endpoint rejects requests with missing webhook headers" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      studio_runner_signing_secret: "studio-secret"
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :MissingHeadersOrchestrator)
+    start_supervised!({Orchestrator, name: orchestrator_name})
+    parent = self()
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      studio_runner_executor: fn work_item -> send(parent, {:unexpected_dispatch, work_item}) end
+    )
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> post(
+        "/api/v1/studio-runner/events",
+        Jason.encode!(studio_payload("evt-missing-headers"))
+      )
+
+    assert json_response(conn, 401) == %{
+             "error" => %{
+               "code" => "missing_webhook_headers",
+               "message" => "Missing required webhook headers"
+             }
+           }
+
+    refute_receive {:unexpected_dispatch, _work_item}, 100
+  end
+
+  test "events endpoint rejects invalid webhook timestamps" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      studio_runner_signing_secret: "studio-secret"
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :InvalidTimestampOrchestrator)
+    start_supervised!({Orchestrator, name: orchestrator_name})
+    parent = self()
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      studio_runner_executor: fn work_item -> send(parent, {:unexpected_dispatch, work_item}) end
+    )
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("webhook-id", "evt-invalid-timestamp")
+      |> put_req_header("webhook-timestamp", "not-a-timestamp")
+      |> put_req_header("webhook-signature", "v1,ignored")
+      |> post(
+        "/api/v1/studio-runner/events",
+        Jason.encode!(studio_payload("evt-invalid-timestamp"))
+      )
+
+    assert json_response(conn, 401) == %{
+             "error" => %{
+               "code" => "invalid_webhook_timestamp",
+               "message" => "Invalid webhook timestamp"
+             }
+           }
+
+    refute_receive {:unexpected_dispatch, _work_item}, 100
+  end
+
+  test "events endpoint rejects unsupported webhook signature versions" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      studio_runner_signing_secret: "studio-secret"
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :UnsupportedSignatureVersionOrchestrator)
+    start_supervised!({Orchestrator, name: orchestrator_name})
+    parent = self()
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      studio_runner_executor: fn work_item -> send(parent, {:unexpected_dispatch, work_item}) end
+    )
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("webhook-id", "evt-unsupported-signature")
+      |> put_req_header("webhook-timestamp", Integer.to_string(System.system_time(:second)))
+      |> put_req_header("webhook-signature", "v0,legacy-signature")
+      |> post(
+        "/api/v1/studio-runner/events",
+        Jason.encode!(studio_payload("evt-unsupported-signature"))
+      )
+
+    assert json_response(conn, 401) == %{
+             "error" => %{
+               "code" => "unsupported_signature_version",
+               "message" => "Unsupported webhook signature version"
+             }
+           }
+
+    refute_receive {:unexpected_dispatch, _work_item}, 100
+  end
+
+  test "events endpoint rejects malformed webhook signature headers" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      studio_runner_signing_secret: "studio-secret"
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :MalformedSignatureOrchestrator)
+    start_supervised!({Orchestrator, name: orchestrator_name})
+    parent = self()
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      studio_runner_executor: fn work_item -> send(parent, {:unexpected_dispatch, work_item}) end
+    )
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("webhook-id", "evt-malformed-signature")
+      |> put_req_header("webhook-timestamp", Integer.to_string(System.system_time(:second)))
+      |> put_req_header("webhook-signature", "not-a-versioned-signature")
+      |> post(
+        "/api/v1/studio-runner/events",
+        Jason.encode!(studio_payload("evt-malformed-signature"))
+      )
+
+    assert json_response(conn, 401) == %{
+             "error" => %{
+               "code" => "invalid_webhook_signature",
+               "message" => "Webhook signature verification failed"
+             }
+           }
+
+    refute_receive {:unexpected_dispatch, _work_item}, 100
+  end
+
+  test "events endpoint rejects missing required payload fields" do
+    repo_path =
+      Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(repo_path)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      studio_runner_signing_secret: "studio-secret"
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :MissingPayloadFieldOrchestrator)
+    start_supervised!({Orchestrator, name: orchestrator_name})
+    parent = self()
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      studio_runner_executor: fn work_item -> send(parent, {:unexpected_dispatch, work_item}) end
+    )
+
+    payload =
+      pop_in(studio_payload("evt-missing-change", repo_path), ["data", "change"]) |> elem(1)
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> signed_post("/api/v1/studio-runner/events", payload, "studio-secret")
+
+    assert json_response(conn, 400) == %{
+             "error" => %{
+               "code" => "invalid_payload",
+               "message" => "Missing required payload field: change"
+             }
+           }
+
+    refute_receive {:unexpected_dispatch, _work_item}, 100
+  end
+
+  test "events endpoint rejects invalid JSON payload shapes" do
     write_workflow_file!(Workflow.workflow_file_path(), studio_runner_signing_secret: "studio-secret")
+
+    orchestrator_name = Module.concat(__MODULE__, :InvalidPayloadShapeOrchestrator)
+    start_supervised!({Orchestrator, name: orchestrator_name})
+    parent = self()
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      studio_runner_executor: fn work_item -> send(parent, {:unexpected_dispatch, work_item}) end
+    )
+
+    payload = ["not", "a", "map"]
+    raw_body = Jason.encode!(payload)
+    timestamp = Integer.to_string(System.system_time(:second))
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("webhook-id", "evt-invalid-payload")
+      |> put_req_header("webhook-timestamp", timestamp)
+      |> put_req_header("webhook-signature", signature_header("studio-secret", "evt-invalid-payload", timestamp, raw_body))
+      |> post("/api/v1/studio-runner/events", raw_body)
+
+    assert json_response(conn, 400) == %{
+             "error" => %{"code" => "invalid_payload", "message" => "Missing required payload field: type"}
+           }
+
+    refute_receive {:unexpected_dispatch, _work_item}, 100
+  end
+
+  test "events endpoint reports runner capacity exhaustion" do
+    first_repo_path = Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+    second_repo_path = Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(first_repo_path)
+    File.mkdir_p!(second_repo_path)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      studio_runner_signing_secret: "studio-secret",
+      max_concurrent_agents: 1
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :CapacityExhaustedOrchestrator)
+    start_supervised!({Orchestrator, name: orchestrator_name})
+    parent = self()
+
+    executor = fn work_item ->
+      send(parent, {:executor_started, self(), work_item})
+
+      receive do
+        :release_run -> :ok
+      end
+    end
+
+    start_test_endpoint(orchestrator: orchestrator_name, studio_runner_executor: executor)
+
+    build_conn()
+    |> put_req_header("content-type", "application/json")
+    |> signed_post("/api/v1/studio-runner/events", studio_payload("evt-capacity-one", first_repo_path), "studio-secret")
+    |> json_response(202)
+
+    assert_receive {:executor_started, executor_pid, _work_item}, 500
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> signed_post("/api/v1/studio-runner/events", studio_payload("evt-capacity-two", second_repo_path), "studio-secret")
+
+    assert json_response(conn, 409) == %{
+             "error" => %{
+               "code" => "capacity_exhausted",
+               "message" => "Runner capacity is currently exhausted"
+             }
+           }
+
+    send(executor_pid, :release_run)
+  end
+
+  test "events endpoint reports unavailable orchestrator" do
+    repo_path = Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(repo_path)
+
+    write_workflow_file!(Workflow.workflow_file_path(), studio_runner_signing_secret: "studio-secret")
+
+    start_test_endpoint(orchestrator: Module.concat(__MODULE__, :UnavailableOrchestrator))
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> signed_post("/api/v1/studio-runner/events", studio_payload("evt-unavailable", repo_path), "studio-secret")
+
+    assert json_response(conn, 503) == %{
+             "error" => %{"code" => "orchestrator_unavailable", "message" => "Orchestrator is unavailable"}
+           }
+  end
+
+  test "events endpoint reports dispatch failures" do
+    repo_path = Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(repo_path)
+
+    write_workflow_file!(Workflow.workflow_file_path(), studio_runner_signing_secret: "studio-secret")
+
+    orchestrator_name = Module.concat(__MODULE__, :DispatchFailureOrchestrator)
+
+    start_supervised!({DispatchReplyServer, name: orchestrator_name, reply: {:error, {:dispatch_failed, :boom}}})
+
+    start_test_endpoint(orchestrator: orchestrator_name)
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> signed_post("/api/v1/studio-runner/events", studio_payload("evt-dispatch-failed", repo_path), "studio-secret")
+
+    assert json_response(conn, 503) == %{
+             "error" => %{"code" => "dispatch_failed", "message" => "Runner could not dispatch accepted work"}
+           }
+  end
+
+  test "invalid signature is rejected before dispatch" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      studio_runner_signing_secret: "studio-secret"
+    )
 
     orchestrator_name = Module.concat(__MODULE__, :InvalidSignatureOrchestrator)
     start_supervised!({Orchestrator, name: orchestrator_name})
@@ -160,6 +555,35 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
     refute_receive {:unexpected_dispatch, _work_item}, 100
   end
 
+  test "invalid signature with mixed versions still evaluates v1 candidates" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      studio_runner_signing_secret: "studio-secret"
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :MixedSignatureOrchestrator)
+    start_supervised!({Orchestrator, name: orchestrator_name})
+    parent = self()
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      studio_runner_executor: fn work_item -> send(parent, {:unexpected_dispatch, work_item}) end
+    )
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("webhook-id", "evt-mixed-signature")
+      |> put_req_header("webhook-timestamp", Integer.to_string(System.system_time(:second)))
+      |> put_req_header("webhook-signature", "v0,legacy v1,wrong")
+      |> post(
+        "/api/v1/studio-runner/events",
+        Jason.encode!(studio_payload("evt-mixed-signature"))
+      )
+
+    assert json_response(conn, 401)["error"]["code"] == "invalid_webhook_signature"
+    refute_receive {:unexpected_dispatch, _work_item}, 100
+  end
+
   test "stale timestamps are rejected before dispatch" do
     write_workflow_file!(Workflow.workflow_file_path(),
       studio_runner_signing_secret: "studio-secret",
@@ -184,7 +608,10 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
       |> put_req_header("content-type", "application/json")
       |> put_req_header("webhook-id", "evt-stale")
       |> put_req_header("webhook-timestamp", timestamp)
-      |> put_req_header("webhook-signature", signature_header("studio-secret", "evt-stale", timestamp, raw_body))
+      |> put_req_header(
+        "webhook-signature",
+        signature_header("studio-secret", "evt-stale", timestamp, raw_body)
+      )
       |> post("/api/v1/studio-runner/events", raw_body)
 
     assert json_response(conn, 401) == %{
@@ -198,7 +625,9 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
   end
 
   test "unsupported event type is rejected before dispatch" do
-    write_workflow_file!(Workflow.workflow_file_path(), studio_runner_signing_secret: "studio-secret")
+    write_workflow_file!(Workflow.workflow_file_path(),
+      studio_runner_signing_secret: "studio-secret"
+    )
 
     orchestrator_name = Module.concat(__MODULE__, :UnsupportedEventOrchestrator)
     start_supervised!({Orchestrator, name: orchestrator_name})
@@ -229,7 +658,9 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
   end
 
   test "unknown repo paths are rejected before dispatch" do
-    write_workflow_file!(Workflow.workflow_file_path(), studio_runner_signing_secret: "studio-secret")
+    write_workflow_file!(Workflow.workflow_file_path(),
+      studio_runner_signing_secret: "studio-secret"
+    )
 
     orchestrator_name = Module.concat(__MODULE__, :UnknownRepoPathOrchestrator)
     start_supervised!({Orchestrator, name: orchestrator_name})
@@ -240,12 +671,20 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
       studio_runner_executor: fn work_item -> send(parent, {:unexpected_dispatch, work_item}) end
     )
 
-    missing_repo_path = Path.join(System.tmp_dir!(), "missing-openspec-studio-#{System.unique_integer([:positive])}")
+    missing_repo_path =
+      Path.join(
+        System.tmp_dir!(),
+        "missing-openspec-studio-#{System.unique_integer([:positive])}"
+      )
 
     conn =
       build_conn()
       |> put_req_header("content-type", "application/json")
-      |> signed_post("/api/v1/studio-runner/events", studio_payload("evt-missing-repo", missing_repo_path), "studio-secret")
+      |> signed_post(
+        "/api/v1/studio-runner/events",
+        studio_payload("evt-missing-repo", missing_repo_path),
+        "studio-secret"
+      )
 
     assert json_response(conn, 400) == %{
              "error" => %{
@@ -258,10 +697,14 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
   end
 
   test "duplicate event ids do not start a second run" do
-    repo_path = Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+    repo_path =
+      Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(repo_path)
 
-    write_workflow_file!(Workflow.workflow_file_path(), studio_runner_signing_secret: "studio-secret")
+    write_workflow_file!(Workflow.workflow_file_path(),
+      studio_runner_signing_secret: "studio-secret"
+    )
 
     orchestrator_name = Module.concat(__MODULE__, :DuplicateEventIdOrchestrator)
     start_supervised!({Orchestrator, name: orchestrator_name})
@@ -299,10 +742,14 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
   end
 
   test "duplicate repo/change pairs return a conflict without starting another run" do
-    repo_path = Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+    repo_path =
+      Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(repo_path)
 
-    write_workflow_file!(Workflow.workflow_file_path(), studio_runner_signing_secret: "studio-secret")
+    write_workflow_file!(Workflow.workflow_file_path(),
+      studio_runner_signing_secret: "studio-secret"
+    )
 
     orchestrator_name = Module.concat(__MODULE__, :DuplicateRepoChangeOrchestrator)
     start_supervised!({Orchestrator, name: orchestrator_name})
@@ -351,10 +798,14 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
   end
 
   test "event stream emits current Studio Runner metadata as SSE" do
-    repo_path = Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+    repo_path =
+      Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(repo_path)
 
-    write_workflow_file!(Workflow.workflow_file_path(), studio_runner_signing_secret: "studio-secret")
+    write_workflow_file!(Workflow.workflow_file_path(),
+      studio_runner_signing_secret: "studio-secret"
+    )
 
     orchestrator_name = Module.concat(__MODULE__, :EventStreamSnapshotOrchestrator)
     start_supervised!({Orchestrator, name: orchestrator_name})
@@ -383,7 +834,11 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
 
     build_conn()
     |> put_req_header("content-type", "application/json")
-    |> signed_post("/api/v1/studio-runner/events", studio_payload("evt-stream", repo_path), "studio-secret")
+    |> signed_post(
+      "/api/v1/studio-runner/events",
+      studio_payload("evt-stream", repo_path),
+      "studio-secret"
+    )
     |> json_response(202)
 
     assert_receive {:executor_started, _executor_pid, _work_item}, 500
@@ -407,10 +862,14 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
   end
 
   test "event stream emits live updates after client connects" do
-    repo_path = Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+    repo_path =
+      Path.join(System.tmp_dir!(), "openspec-studio-#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(repo_path)
 
-    write_workflow_file!(Workflow.workflow_file_path(), studio_runner_signing_secret: "studio-secret")
+    write_workflow_file!(Workflow.workflow_file_path(),
+      studio_runner_signing_secret: "studio-secret"
+    )
 
     orchestrator_name = Module.concat(__MODULE__, :EventStreamLiveOrchestrator)
     start_supervised!({Orchestrator, name: orchestrator_name})
@@ -432,7 +891,11 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
 
     build_conn()
     |> put_req_header("content-type", "application/json")
-    |> signed_post("/api/v1/studio-runner/events", studio_payload("evt-live-stream", repo_path), "studio-secret")
+    |> signed_post(
+      "/api/v1/studio-runner/events",
+      studio_payload("evt-live-stream", repo_path),
+      "studio-secret"
+    )
     |> json_response(202)
 
     assert_receive {:executor_started, _executor_pid, _work_item}, 500
@@ -440,6 +903,91 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
 
     assert conn.resp_body =~ "event: runner.blocked"
     assert conn.resp_body =~ "evt-live-stream"
+  end
+
+  test "event stream maps terminal statuses to event names" do
+    write_workflow_file!(Workflow.workflow_file_path(), studio_runner_signing_secret: "studio-secret")
+
+    orchestrator_name = Module.concat(__MODULE__, :EventStreamStatusOrchestrator)
+
+    empty_snapshot = %{
+      running: [],
+      retrying: [],
+      studio_runner: %{running: [], events: []},
+      codex_totals: nil,
+      rate_limits: nil
+    }
+
+    snapshot = %{
+      running: [],
+      retrying: [],
+      studio_runner: %{
+        running: [],
+        events: [
+          %{
+            event_id: "evt-completed",
+            status: "completed",
+            run_id: "run-completed",
+            repo_change_key: "repo/change/completed",
+            recorded_at: DateTime.utc_now()
+          },
+          %{
+            event_id: "evt-failed",
+            status: "failed",
+            run_id: "run-failed",
+            repo_change_key: "repo/change/failed",
+            recorded_at: DateTime.utc_now()
+          },
+          %{
+            event_id: "evt-accepted",
+            status: "accepted",
+            run_id: "run-accepted",
+            repo_change_key: "repo/change/accepted",
+            recorded_at: DateTime.utc_now()
+          },
+          %{
+            event_id: "evt-unknown",
+            status: "surprising",
+            run_id: "run-unknown",
+            repo_change_key: "repo/change/unknown",
+            recorded_at: DateTime.utc_now()
+          }
+        ]
+      },
+      codex_totals: nil,
+      rate_limits: nil
+    }
+
+    start_supervised!({DispatchReplyServer, name: orchestrator_name, reply: empty_snapshot})
+    start_test_endpoint(orchestrator: orchestrator_name)
+
+    stream_task =
+      Task.async(fn ->
+        get(build_conn(), "/api/v1/studio-runner/events/stream?limit=4", %{})
+      end)
+
+    :timer.sleep(50)
+    assert :ok = GenServer.call(orchestrator_name, {:set_reply, snapshot})
+    :ok = SymphonyElixirWeb.ObservabilityPubSub.broadcast_update()
+
+    conn = Task.await(stream_task, 1_000)
+
+    assert conn.resp_body =~ "event: runner.completed"
+    assert conn.resp_body =~ "event: runner.failed"
+    assert conn.resp_body =~ "event: runner.accepted"
+    assert conn.resp_body =~ "event: runner.update"
+  end
+
+  test "studio runner routes reject unsupported methods" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      studio_runner_signing_secret: "studio-secret"
+    )
+
+    start_test_endpoint([])
+
+    assert json_response(delete(build_conn(), "/api/v1/studio-runner/events"), 405) == %{
+             "error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}
+           }
   end
 
   defp assert_eventually(fun, attempts \\ 20)
@@ -474,7 +1022,10 @@ defmodule SymphonyElixir.StudioRunnerIngressTest do
     conn
     |> put_req_header("webhook-id", event_id)
     |> put_req_header("webhook-timestamp", timestamp)
-    |> put_req_header("webhook-signature", signature_header(signing_secret, event_id, timestamp, raw_body))
+    |> put_req_header(
+      "webhook-signature",
+      signature_header(signing_secret, event_id, timestamp, raw_body)
+    )
     |> post(path, raw_body)
   end
 

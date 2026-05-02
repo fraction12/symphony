@@ -3,6 +3,213 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
 
   alias SymphonyElixir.StudioRunner.{Executor, WorkItem}
 
+  test "run reports execution preparation failures" do
+    work_item = %WorkItem{
+      event_id: "evt-invalid-run",
+      event_type: "build.requested",
+      repo_path: 123,
+      change: "add-runner-work"
+    }
+
+    assert {:error, {:invalid_repo_path, :not_string}} = Executor.run(work_item)
+  end
+
+  test "source repo metadata accepts injected discovery and fetch failure is bounded" do
+    parent = self()
+    work_item = %WorkItem{event_id: "evt-source-meta", change: "add-runner-work"}
+
+    assert {:ok, %{remote_name: "origin"}} =
+             Executor.source_repo_git_metadata("/tmp/source", work_item,
+               discover_git_source: fn source_repo, discovered_work_item ->
+                 send(parent, {:discovered, source_repo, discovered_work_item})
+                 {:ok, %{remote_name: "origin"}}
+               end
+             )
+
+    assert_receive {:discovered, "/tmp/source", ^work_item}, 500
+
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "studio-runner-fetch-failure-#{System.unique_integer([:positive])}"
+      )
+
+    source_repo = Path.join(test_root, "source")
+    File.mkdir_p!(source_repo)
+    System.cmd("git", ["init", "--quiet"], cd: source_repo)
+
+    try do
+      assert {:error, {:source_fetch_failed, {_command, _status, _output}}} =
+               Executor.fetch_source_remote(source_repo, %{remote_name: "origin"})
+    after
+      File.rm_rf!(test_root)
+    end
+  end
+
+  test "source repo metadata falls back to request remote metadata" do
+    test_root = Path.join(System.tmp_dir!(), "studio-runner-source-fallback-#{System.unique_integer([:positive])}")
+    source_repo = Path.join(test_root, "source")
+    File.mkdir_p!(source_repo)
+    System.cmd("git", ["init", "--quiet"], cd: source_repo)
+    System.cmd("git", ["checkout", "-B", "main", "--quiet"], cd: source_repo)
+    System.cmd("git", ["config", "user.email", "test@example.com"], cd: source_repo)
+    System.cmd("git", ["config", "user.name", "Test User"], cd: source_repo)
+    File.write!(Path.join(source_repo, "README.md"), "source")
+    System.cmd("git", ["add", "."], cd: source_repo)
+    System.cmd("git", ["commit", "-m", "initial"], cd: source_repo)
+    {head, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: source_repo)
+    System.cmd("git", ["update-ref", "refs/remotes/origin/main", String.trim(head)], cd: source_repo)
+    {:ok, canonical_source_repo} = SymphonyElixir.PathSafety.canonicalize(source_repo)
+
+    try do
+      fallback_work_item = %WorkItem{
+        event_id: "evt-source-fallback",
+        repo_remote: " git@example.com:source.git "
+      }
+
+      assert {:ok, git_source} = Executor.source_repo_git_metadata(canonical_source_repo, fallback_work_item)
+
+      assert git_source.remote_url == "git@example.com:source.git"
+      assert git_source.default_branch == "main"
+
+      assert {:error, {:missing_remote, "origin"}} =
+               Executor.discover_git_source(canonical_source_repo, %WorkItem{
+                 event_id: "evt-source-blank-remote",
+                 repo_remote: " "
+               })
+    after
+      File.rm_rf!(test_root)
+    end
+  end
+
+  test "source repo metadata parses remote show default branch" do
+    test_root = Path.join(System.tmp_dir!(), "studio-runner-remote-show-#{System.unique_integer([:positive])}")
+    source_repo = Path.join(test_root, "source")
+    remote_repo = Path.join(test_root, "remote.git")
+
+    File.mkdir_p!(source_repo)
+    System.cmd("git", ["init", "--bare", "--quiet", remote_repo])
+    System.cmd("git", ["symbolic-ref", "HEAD", "refs/heads/main"], cd: remote_repo)
+    System.cmd("git", ["init", "--quiet"], cd: source_repo)
+    System.cmd("git", ["checkout", "-B", "main", "--quiet"], cd: source_repo)
+    System.cmd("git", ["config", "user.email", "test@example.com"], cd: source_repo)
+    System.cmd("git", ["config", "user.name", "Test User"], cd: source_repo)
+    File.write!(Path.join(source_repo, "README.md"), "source")
+    System.cmd("git", ["add", "."], cd: source_repo)
+    System.cmd("git", ["commit", "-m", "initial"], cd: source_repo)
+    System.cmd("git", ["remote", "add", "origin", remote_repo], cd: source_repo)
+    System.cmd("git", ["push", "-u", "origin", "main"], cd: source_repo)
+    System.cmd("git", ["remote", "set-head", "origin", "-d"], cd: source_repo)
+    {:ok, canonical_source_repo} = SymphonyElixir.PathSafety.canonicalize(source_repo)
+
+    try do
+      assert {:ok, git_source} =
+               Executor.discover_git_source(canonical_source_repo, %WorkItem{event_id: "evt-remote-show"})
+
+      assert git_source.default_branch == "main"
+      assert git_source.remote_ref == "origin/main"
+    after
+      File.rm_rf!(test_root)
+    end
+  end
+
+  test "source repo metadata includes remote lookup reason when no fallback exists" do
+    test_root = Path.join(System.tmp_dir!(), "studio-runner-no-remote-#{System.unique_integer([:positive])}")
+    source_repo = Path.join(test_root, "source")
+    File.mkdir_p!(source_repo)
+    System.cmd("git", ["init", "--quiet"], cd: source_repo)
+    System.cmd("git", ["checkout", "-B", "main", "--quiet"], cd: source_repo)
+    System.cmd("git", ["config", "user.email", "test@example.com"], cd: source_repo)
+    System.cmd("git", ["config", "user.name", "Test User"], cd: source_repo)
+    File.write!(Path.join(source_repo, "README.md"), "source")
+    System.cmd("git", ["add", "."], cd: source_repo)
+    System.cmd("git", ["commit", "-m", "initial"], cd: source_repo)
+    {:ok, canonical_source_repo} = SymphonyElixir.PathSafety.canonicalize(source_repo)
+
+    try do
+      assert {:error, {:missing_remote, "origin", {_command, _status, _output}}} =
+               Executor.discover_git_source(canonical_source_repo, %WorkItem{
+                 event_id: "evt-source-no-remote"
+               })
+    after
+      File.rm_rf!(test_root)
+    end
+  end
+
+  test "source repo metadata reports missing default branch when it cannot be inferred" do
+    test_root = Path.join(System.tmp_dir!(), "studio-runner-missing-default-#{System.unique_integer([:positive])}")
+    source_repo = Path.join(test_root, "source")
+    File.mkdir_p!(source_repo)
+    System.cmd("git", ["init", "--quiet"], cd: source_repo)
+    System.cmd("git", ["checkout", "-B", "main", "--quiet"], cd: source_repo)
+    System.cmd("git", ["config", "user.email", "test@example.com"], cd: source_repo)
+    System.cmd("git", ["config", "user.name", "Test User"], cd: source_repo)
+    File.write!(Path.join(source_repo, "README.md"), "source")
+    System.cmd("git", ["add", "."], cd: source_repo)
+    System.cmd("git", ["commit", "-m", "initial"], cd: source_repo)
+    {:ok, canonical_source_repo} = SymphonyElixir.PathSafety.canonicalize(source_repo)
+
+    try do
+      assert {:error, {:missing_remote_default_branch, _reason}} =
+               Executor.discover_git_source(canonical_source_repo, %WorkItem{
+                 event_id: "evt-source-no-default",
+                 repo_remote: "git@example.com:source.git"
+               })
+    after
+      File.rm_rf!(test_root)
+    end
+  end
+
+  test "workspace preparation stops when source fetch fails" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "studio-runner-prepare-fetch-#{System.unique_integer([:positive])}"
+      )
+
+    source_repo = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+
+    File.mkdir_p!(source_repo)
+    System.cmd("git", ["init", "--quiet"], cd: source_repo)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    git_source = %{remote_name: "origin", remote_ref: "origin/main"}
+
+    work_item = %WorkItem{
+      event_id: "evt-fetch-fails",
+      repo_path: source_repo,
+      change: "add-runner-work"
+    }
+
+    fetch_remote = fn _source_repo, _git_source -> {:error, :fetch_blocked} end
+
+    try do
+      assert {:error, :fetch_blocked} =
+               Executor.prepare_worktree_workspace(source_repo, git_source, work_item, fetch_remote: fetch_remote)
+    after
+      File.rm_rf!(test_root)
+    end
+  end
+
+  test "workspace cleanup rejects the configured workspace root" do
+    test_root = Path.join(System.tmp_dir!(), "studio-runner-root-cleanup-#{System.unique_integer([:positive])}")
+    source_repo = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    create_source_repo!(source_repo, test_root, "cleanup-root")
+    File.mkdir_p!(workspace_root)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    try do
+      assert %{cleanupStatus: "blocked", cleanupError: error} =
+               Executor.remove_worktree(source_repo, workspace_root)
+
+      assert error =~ "workspace_equals_root"
+    after
+      File.rm_rf!(test_root)
+    end
+  end
+
   test "executor prepares a managed workspace from source repo without mutating original" do
     test_root =
       Path.join(System.tmp_dir!(), "studio-runner-executor-#{System.unique_integer([:positive])}")
@@ -129,6 +336,110 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
     :ok
   end
 
+  test "executor run completes through default Codex runner and publication inspection" do
+    test_root =
+      Path.join(System.tmp_dir!(), "studio-runner-default-run-#{System.unique_integer([:positive])}")
+
+    source_repo = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    change = "default-run-work"
+    create_source_repo!(source_repo, test_root, change)
+
+    codex_bin = Path.join(test_root, "bin/codex")
+    gh_bin = Path.join(test_root, "bin/gh")
+    File.mkdir_p!(Path.dirname(codex_bin))
+
+    File.write!(codex_bin, """
+    #!/bin/sh
+    count=0
+
+    while IFS= read -r line; do
+      count=$((count + 1))
+
+      case "$count" in
+        1)
+          printf '%s\n' '{"id":1,"result":{}}'
+          ;;
+        2)
+          printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-default-run"}}}'
+          ;;
+        3)
+          printf 'changed\n' > DEFAULT_RUN_RESULT
+          git add DEFAULT_RUN_RESULT >/dev/null 2>&1
+          git commit -m 'default runner result' >/dev/null 2>&1
+          printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-default-run"}}}'
+          ;;
+        4)
+          printf '%s\n' '{"method":"turn/completed"}'
+          exit 0
+          ;;
+        *)
+          exit 0
+          ;;
+      esac
+    done
+    """)
+
+    File.write!(gh_bin, """
+    #!/bin/sh
+    echo '{"url":"https://github.com/example/source/pull/99","state":"MERGED","mergedAt":"2026-05-02T12:00:00Z","closedAt":"2026-05-02T12:00:00Z"}'
+    """)
+
+    File.chmod!(codex_bin, 0o755)
+    File.chmod!(gh_bin, 0o755)
+
+    old_path = System.get_env("PATH")
+    System.put_env("PATH", Path.dirname(codex_bin) <> ":" <> (old_path || ""))
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_bin} app-server"
+    )
+
+    try do
+      assert {:ok, metadata} =
+               Executor.run(%WorkItem{
+                 event_id: "evt-default-run",
+                 run_id: "run_default_run",
+                 event_type: "build.requested",
+                 repo_path: source_repo,
+                 repo_name: "source",
+                 change: change
+               })
+
+      assert metadata.status == "completed"
+      assert metadata.workspaceStatus == "published"
+      assert metadata.sessionId == "thread-default-run-turn-default-run"
+      assert metadata.prUrl == "https://github.com/example/source/pull/99"
+      assert metadata.prState == "MERGED"
+      assert metadata.cleanupEligible == true
+      assert metadata.cleanupReason == "pr_merged"
+      assert File.exists?(Path.join(metadata.workspacePath, "DEFAULT_RUN_RESULT"))
+    after
+      restore_path!(old_path)
+      File.rm_rf!(test_root)
+    end
+  end
+
+  test "executor rejects invalid change names before workspace preparation" do
+    test_root = Path.join(System.tmp_dir!(), "studio-runner-invalid-change-#{System.unique_integer([:positive])}")
+    source_repo = Path.join(test_root, "source")
+    create_source_repo!(source_repo, test_root, "safe-change")
+
+    try do
+      assert {:error, {:invalid_change_name, nil}} =
+               Executor.execute(%WorkItem{
+                 event_id: "evt-invalid-change",
+                 event_type: "build.requested",
+                 repo_path: source_repo,
+                 repo_name: "source",
+                 change: nil
+               })
+    after
+      File.rm_rf!(test_root)
+    end
+  end
+
   test "same event retry reuses its existing worktree but new events do not" do
     test_root =
       Path.join(System.tmp_dir!(), "studio-runner-retry-#{System.unique_integer([:positive])}")
@@ -227,6 +538,85 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
     File.rm_rf!(test_root)
   end
 
+  test "cleanup metadata covers active, debugging, abandoned, and unknown workspace states" do
+    now = ~U[2026-05-02 12:00:00Z]
+    recent = ~U[2026-05-02 11:00:00Z]
+    stale_debug = ~U[2026-04-20 12:00:00Z]
+    stale_abandoned = "2026-04-20T12:00:00Z"
+
+    assert %{cleanupEligible: false, cleanupReason: "active"} =
+             Executor.cleanup_metadata(
+               %{status: "running", workspacePath: "/workspace/running"},
+               now
+             )
+
+    assert %{cleanupEligible: false, cleanupReason: "active"} =
+             Executor.cleanup_metadata(
+               %{status: "accepted", workspacePath: "/workspace/accepted"},
+               now
+             )
+
+    assert %{cleanupEligible: false, cleanupReason: "debug_ttl"} =
+             Executor.cleanup_metadata(
+               %{status: "blocked", workspacePath: "/workspace/blocked", updatedAt: recent},
+               now
+             )
+
+    assert %{cleanupEligible: true, cleanupReason: "debug_ttl_expired"} =
+             Executor.cleanup_metadata(
+               %{status: "failed", workspacePath: "/workspace/failed", updatedAt: stale_debug},
+               now
+             )
+
+    assert %{cleanupEligible: false, cleanupReason: "abandoned_ttl"} =
+             Executor.cleanup_metadata(
+               %{
+                 status: "abandoned",
+                 workspacePath: "/workspace/abandoned",
+                 updatedAt: "not-a-date"
+               },
+               now
+             )
+
+    assert %{cleanupEligible: true, cleanupReason: "abandoned_ttl_expired"} =
+             Executor.cleanup_metadata(
+               %{
+                 status: "abandoned",
+                 workspacePath: "/workspace/abandoned-old",
+                 updatedAt: stale_abandoned
+               },
+               now
+             )
+
+    assert %{cleanupEligible: false, cleanupReason: "abandoned_ttl"} =
+             Executor.cleanup_metadata(
+               %{
+                 status: "abandoned",
+                 workspacePath: "/workspace/abandoned-integer",
+                 updatedAt: 123
+               },
+               now
+             )
+
+    assert %{cleanupEligible: false} =
+             completed_without_pr =
+             Executor.cleanup_metadata(
+               %{status: "completed", workspacePath: "/workspace/completed"},
+               now
+             )
+
+    refute Map.has_key?(completed_without_pr, :cleanupReason)
+
+    assert %{cleanupEligible: false} =
+             metadata =
+             Executor.cleanup_metadata(
+               %{status: "mystery", workspacePath: "/workspace/mystery"},
+               now
+             )
+
+    refute Map.has_key?(metadata, :cleanupReason)
+  end
+
   test "orchestrator status captures blocked Studio Runner execution metadata" do
     work_item = %WorkItem{
       event_id: "evt-orchestrator-result",
@@ -313,6 +703,54 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
     assert %{events: [event_payload]} = snapshot.studio_runner
     assert event_payload.runnerModel == "gpt-custom"
     assert event_payload.runnerEffort == "high"
+  end
+
+  test "executor omits blank runner turn options" do
+    test_root =
+      Path.join(System.tmp_dir!(), "studio-runner-blank-options-#{System.unique_integer([:positive])}")
+
+    source_repo = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    change = "blank-options-work"
+    create_source_repo!(source_repo, test_root, change)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+    parent = self()
+
+    work_item = %WorkItem{
+      event_id: "evt-blank-options",
+      run_id: "run_blank_options",
+      event_type: "build.requested",
+      repo_path: source_repo,
+      repo_name: "source",
+      change: change,
+      runner_model: "",
+      runner_effort: ""
+    }
+
+    try do
+      assert {:ok, _context, _result} =
+               Executor.execute(work_item,
+                 codex_runner: fn _workspace, _prompt, _runner_work_item, opts ->
+                   send(parent, {:codex_opts, opts})
+                   {:ok, %{session_id: "session-blank-options"}}
+                 end,
+                 publish_inspector: fn _workspace, context ->
+                   {:ok,
+                    %{
+                      status: "completed",
+                      branch_name: context.branch_name,
+                      commit_sha: "0123456789abcdef0123456789abcdef01234567",
+                      pr_url: "https://github.com/example/source/pull/123"
+                    }}
+                 end
+               )
+
+      assert_receive {:codex_opts, opts}, 500
+      refute Keyword.has_key?(opts, :model)
+      refute Keyword.has_key?(opts, :effort)
+    after
+      File.rm_rf!(test_root)
+    end
   end
 
   test "publication inspection reports completed only when a pull request exists" do
@@ -414,7 +852,12 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
 
     workspace = Path.join(test_root, "workspace")
     File.mkdir_p!(workspace)
-    old_path = install_fake_gh!(test_root, ~s({"url":"https://github.com/example/source/pull/42","state":"OPEN","mergedAt":null,"closedAt":null}))
+
+    old_path =
+      install_fake_gh!(
+        test_root,
+        ~s({"url":"https://github.com/example/source/pull/42","state":"OPEN","mergedAt":null,"closedAt":null})
+      )
 
     try do
       assert %{
@@ -436,13 +879,21 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
 
   test "cleanup metadata refreshes stale pull request state before evaluating cleanup" do
     test_root =
-      Path.join(System.tmp_dir!(), "studio-runner-merged-pr-#{System.unique_integer([:positive])}")
+      Path.join(
+        System.tmp_dir!(),
+        "studio-runner-merged-pr-#{System.unique_integer([:positive])}"
+      )
 
     workspace = Path.join(test_root, "workspace")
     File.mkdir_p!(workspace)
 
     merged_at = "2026-04-30T15:00:00Z"
-    old_path = install_fake_gh!(test_root, ~s({"url":"https://github.com/example/source/pull/42","state":"MERGED","mergedAt":"#{merged_at}","closedAt":"#{merged_at}"}))
+
+    old_path =
+      install_fake_gh!(
+        test_root,
+        ~s({"url":"https://github.com/example/source/pull/42","state":"MERGED","mergedAt":"#{merged_at}","closedAt":"#{merged_at}"})
+      )
 
     try do
       assert %{
@@ -465,7 +916,10 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
 
   test "cleanup metadata defers completed pull requests when state cannot be refreshed" do
     test_root =
-      Path.join(System.tmp_dir!(), "studio-runner-unknown-pr-#{System.unique_integer([:positive])}")
+      Path.join(
+        System.tmp_dir!(),
+        "studio-runner-unknown-pr-#{System.unique_integer([:positive])}"
+      )
 
     workspace = Path.join(test_root, "workspace")
     bin_dir = Path.join(test_root, "bin")
@@ -493,14 +947,22 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
 
   test "cleanup metadata retains recently closed pull requests until the retention TTL expires" do
     test_root =
-      Path.join(System.tmp_dir!(), "studio-runner-closed-pr-#{System.unique_integer([:positive])}")
+      Path.join(
+        System.tmp_dir!(),
+        "studio-runner-closed-pr-#{System.unique_integer([:positive])}"
+      )
 
     workspace = Path.join(test_root, "workspace")
     File.mkdir_p!(workspace)
 
     now = ~U[2026-04-30 20:00:00Z]
     closed_at = "2026-04-29T20:00:00Z"
-    old_path = install_fake_gh!(test_root, ~s({"url":"https://github.com/example/source/pull/42","state":"CLOSED","mergedAt":null,"closedAt":"#{closed_at}"}))
+
+    old_path =
+      install_fake_gh!(
+        test_root,
+        ~s({"url":"https://github.com/example/source/pull/42","state":"CLOSED","mergedAt":null,"closedAt":"#{closed_at}"})
+      )
 
     try do
       assert %{
@@ -525,14 +987,22 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
 
   test "cleanup metadata allows closed pull requests after the retention TTL" do
     test_root =
-      Path.join(System.tmp_dir!(), "studio-runner-expired-pr-#{System.unique_integer([:positive])}")
+      Path.join(
+        System.tmp_dir!(),
+        "studio-runner-expired-pr-#{System.unique_integer([:positive])}"
+      )
 
     workspace = Path.join(test_root, "workspace")
     File.mkdir_p!(workspace)
 
     now = ~U[2026-04-30 20:00:00Z]
     closed_at = "2026-04-20T20:00:00Z"
-    old_path = install_fake_gh!(test_root, ~s({"url":"https://github.com/example/source/pull/42","state":"CLOSED","mergedAt":null,"closedAt":"#{closed_at}"}))
+
+    old_path =
+      install_fake_gh!(
+        test_root,
+        ~s({"url":"https://github.com/example/source/pull/42","state":"CLOSED","mergedAt":null,"closedAt":"#{closed_at}"})
+      )
 
     try do
       assert %{
@@ -569,13 +1039,21 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
 
   test "cleanup metadata allows merged pull request workspaces when refreshed state is available" do
     test_root =
-      Path.join(System.tmp_dir!(), "studio-runner-merged-pr-#{System.unique_integer([:positive])}")
+      Path.join(
+        System.tmp_dir!(),
+        "studio-runner-merged-pr-#{System.unique_integer([:positive])}"
+      )
 
     workspace = Path.join(test_root, "workspace")
     File.mkdir_p!(workspace)
 
     merged_at = "2026-04-30T15:00:00Z"
-    old_path = install_fake_gh!(test_root, ~s({"url":"https://github.com/example/source/pull/42","state":"MERGED","mergedAt":"#{merged_at}","closedAt":"#{merged_at}"}))
+
+    old_path =
+      install_fake_gh!(
+        test_root,
+        ~s({"url":"https://github.com/example/source/pull/42","state":"MERGED","mergedAt":"#{merged_at}","closedAt":"#{merged_at}"})
+      )
 
     try do
       assert %{
@@ -636,6 +1114,105 @@ defmodule SymphonyElixir.StudioRunnerExecutorTest do
       assert metadata.error =~ "no pushed branch or pull request"
     after
       if old_path, do: System.put_env("PATH", old_path), else: System.delete_env("PATH")
+      File.rm_rf!(test_root)
+    end
+  end
+
+  test "publication inspection reports blocked when branch cannot be detected" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "studio-runner-detached-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(test_root, "workspace")
+    File.mkdir_p!(workspace)
+    System.cmd("git", ["init", "--quiet"], cd: workspace)
+    System.cmd("git", ["config", "user.email", "test@example.com"], cd: workspace)
+    System.cmd("git", ["config", "user.name", "Test User"], cd: workspace)
+    File.write!(Path.join(workspace, "CHANGE"), "done")
+    System.cmd("git", ["add", "."], cd: workspace)
+    System.cmd("git", ["commit", "-m", "change"], cd: workspace)
+    {head, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: workspace)
+    System.cmd("git", ["checkout", "--detach", String.trim(head), "--quiet"], cd: workspace)
+
+    try do
+      assert {:ok, metadata} =
+               Executor.inspect_workspace_publication(workspace, %{branch_name: nil})
+
+      assert metadata.status == "blocked"
+      assert metadata.branch_name == nil
+      assert metadata.commit_sha =~ ~r/^[0-9a-f]{40}$/
+      assert metadata.error =~ "without a detectable branch"
+    after
+      File.rm_rf!(test_root)
+    end
+  end
+
+  test "publication inspection reports pushed branches without pull requests" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "studio-runner-pushed-branch-#{System.unique_integer([:positive])}"
+      )
+
+    remote_repo = Path.join(test_root, "remote.git")
+    workspace = Path.join(test_root, "workspace")
+    File.mkdir_p!(workspace)
+    System.cmd("git", ["init", "--bare", "--quiet", remote_repo])
+    System.cmd("git", ["init", "--quiet"], cd: workspace)
+    System.cmd("git", ["checkout", "-B", "studio-runner/change/event", "--quiet"], cd: workspace)
+    System.cmd("git", ["config", "user.email", "test@example.com"], cd: workspace)
+    System.cmd("git", ["config", "user.name", "Test User"], cd: workspace)
+    File.write!(Path.join(workspace, "CHANGE"), "done")
+    System.cmd("git", ["add", "."], cd: workspace)
+    System.cmd("git", ["commit", "-m", "change"], cd: workspace)
+    System.cmd("git", ["remote", "add", "origin", remote_repo], cd: workspace)
+    System.cmd("git", ["push", "-u", "origin", "studio-runner/change/event"], cd: workspace)
+
+    old_path = System.get_env("PATH")
+    System.put_env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+
+    try do
+      assert {:ok, metadata} =
+               Executor.inspect_workspace_publication(workspace, %{
+                 branch_name: "studio-runner/change/event"
+               })
+
+      assert metadata.status == "blocked"
+      assert metadata.error =~ "created/pushed branch"
+    after
+      restore_path!(old_path)
+      File.rm_rf!(test_root)
+    end
+  end
+
+  test "change artifact loading normalizes optional and truncated artifacts" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "studio-runner-artifacts-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(test_root, "workspace")
+    change_root = Path.join(workspace, "openspec/changes/coverage-work")
+    File.mkdir_p!(Path.join(change_root, "specs/runner"))
+    File.write!(Path.join(change_root, "proposal.md"), String.duplicate("p", 65_000))
+    File.write!(Path.join(change_root, "tasks.md"), "## Tasks\n- [ ] Cover branches\n")
+    File.mkdir_p!(Path.join(change_root, "design.md"))
+    File.write!(Path.join(change_root, "specs/runner/spec.md"), String.duplicate("s", 65_000))
+
+    try do
+      assert {:ok, artifacts} = Executor.load_change_artifacts(workspace, "coverage-work")
+      assert artifacts.proposal =~ "[truncated]"
+      assert artifacts.design == nil
+      assert artifacts.tasks =~ "Cover branches"
+      assert [{"specs/runner/spec.md", spec_content}] = artifacts.specs
+      assert spec_content =~ "[truncated]"
+
+      assert {:error, {:missing_change, "missing-work"}} =
+               Executor.load_change_artifacts(workspace, "missing-work")
+    after
       File.rm_rf!(test_root)
     end
   end

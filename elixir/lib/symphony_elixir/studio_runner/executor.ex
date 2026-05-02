@@ -790,7 +790,7 @@ defmodule SymphonyElixir.StudioRunner.Executor do
       change: work_item.change,
       branch_name: workspace_lifecycle.branch_name,
       artifacts: artifacts,
-      validation: work_item.validation || %{},
+      validation: work_item.validation,
       git_ref: work_item.git_ref,
       base_commit_sha: workspace_lifecycle.base_commit_sha,
       requested_by: work_item.requested_by,
@@ -857,34 +857,20 @@ defmodule SymphonyElixir.StudioRunner.Executor do
     codex_runner.(workspace, prompt, work_item, Keyword.merge(opts, runner_turn_options(work_item)))
   end
 
-  defp default_codex_runner(workspace, prompt, work_item, opts) do
-    max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
-
+  defp default_codex_runner(workspace, prompt, work_item, _opts) do
     with {:ok, session} <- AppServer.start_session(workspace) do
       try do
-        run_codex_turns(session, workspace, prompt, work_item, 1, max_turns)
+        run_codex_turn(session, workspace, prompt, work_item)
       after
         AppServer.stop_session(session)
       end
     end
   end
 
-  defp run_codex_turns(session, workspace, prompt, work_item, turn_number, max_turns) do
-    turn_prompt =
-      if turn_number == 1, do: prompt, else: continuation_prompt(turn_number, max_turns)
-
-    case AppServer.run_turn(session, turn_prompt, issue_like_context(work_item), runner_turn_options(work_item)) do
-      {:ok, result} ->
-        if turn_number < max_turns do
-          # Studio Runner has no tracker state to poll yet. One successful turn is the
-          # first safe slice; later status extraction can decide whether to continue.
-          {:ok, Map.put(result, :workspace_path, workspace)}
-        else
-          {:ok, Map.put(result, :workspace_path, workspace)}
-        end
-
-      {:error, reason} ->
-        {:error, reason}
+  defp run_codex_turn(session, workspace, prompt, work_item) do
+    case AppServer.run_turn(session, prompt, issue_like_context(work_item), runner_turn_options(work_item)) do
+      {:ok, result} -> {:ok, Map.put(result, :workspace_path, workspace)}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -1135,16 +1121,6 @@ defmodule SymphonyElixir.StudioRunner.Executor do
   end
 
   defp blank_to_nil(_value), do: nil
-
-  defp continuation_prompt(turn_number, max_turns) do
-    """
-    Continuation guidance:
-
-    - This is continuation turn #{turn_number} of #{max_turns} for the current Studio Runner OpenSpec run.
-    - Resume from the current workspace and continue the selected OpenSpec change.
-    - Do not restart from scratch. Focus only on remaining implementation, validation, branch, commit, push, and PR work.
-    """
-  end
 
   defp issue_like_context(%WorkItem{} = work_item) do
     %{
